@@ -5,7 +5,79 @@ use ropey::{iter::Chunks, str_utils::byte_to_char_idx, RopeSlice};
 use unicode_segmentation::{GraphemeCursor, GraphemeIncomplete};
 use unicode_width::UnicodeWidthStr;
 
-use std::fmt;
+use std::borrow::Cow;
+use std::fmt::{self, Display};
+
+use crate::LineEnding;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// A preprossed Grapheme that is ready for rendering
+pub enum Grapheme<'a> {
+    Space,
+    Newline,
+    Nbsp,
+    Tab { width: u16 },
+    Other { raw: Cow<'a, str>, width: u16 },
+}
+
+impl<'a> Grapheme<'a> {
+    pub fn new(raw: Cow<'a, str>, visual_x: usize, tab_width: u16) -> Grapheme<'a> {
+        match &*raw {
+            "\t" => {
+                let width = tab_width - (visual_x % tab_width as usize) as u16;
+                Grapheme::Tab { width }
+            }
+            " " => Grapheme::Space,
+            "\u{00A0}" => Grapheme::Nbsp,
+            _ if LineEnding::from_str(&raw).is_some() => Grapheme::Newline,
+            _ => Grapheme::Other {
+                width: grapheme_width(&*raw) as u16,
+                raw,
+            },
+        }
+    }
+
+    pub fn change_position(&mut self, visual_x: usize, tab_width: u16) {
+        if let Grapheme::Tab { width } = self {
+            *width = tab_width - (visual_x % tab_width as usize) as u16
+        }
+    }
+
+    /// Returns the approximate visual width of this grapheme,
+    /// This serves as a lower bound for the width for use during soft wrapping.
+    /// The actual displayed witdth might be position dependent and larger (primarly tabs)
+    pub fn width(&self) -> u16 {
+        match *self {
+            Grapheme::Other { width, .. } | Grapheme::Tab { width } => width,
+            _ => 1,
+        }
+    }
+
+    pub fn is_whitespace(&self) -> bool {
+        !matches!(&self, Grapheme::Other { .. })
+    }
+
+    pub fn is_breaking_space(&self) -> bool {
+        !matches!(&self, Grapheme::Other { .. } | Grapheme::Nbsp)
+    }
+}
+
+impl Display for Grapheme<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Grapheme::Space | Grapheme::Newline | Grapheme::Nbsp => write!(f, " "),
+            Grapheme::Tab { width } => {
+                for _ in 0..width {
+                    write!(f, " ")?;
+                }
+                Ok(())
+            }
+            Grapheme::Other { ref raw, .. } => {
+                write!(f, "{raw}")
+            }
+        }
+    }
+}
 
 #[must_use]
 pub fn grapheme_width(g: &str) -> usize {

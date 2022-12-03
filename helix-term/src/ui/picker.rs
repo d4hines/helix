@@ -1,7 +1,7 @@
 use crate::{
     compositor::{Component, Compositor, Context, Event, EventResult},
     ctrl, key, shift,
-    ui::{self, fuzzy_match::FuzzyQuery, EditorView},
+    ui::{self, document::render_document, fuzzy_match::FuzzyQuery, EditorView},
 };
 use futures_util::future::BoxFuture;
 use tui::{
@@ -19,10 +19,11 @@ use std::{
 use std::{collections::HashMap, io::Read, path::PathBuf};
 
 use crate::ui::{Prompt, PromptEvent};
-use helix_core::{movement::Direction, Position};
+use helix_core::{movement::Direction, text_annotations::TextAnnotations, Position};
 use helix_view::{
     editor::Action,
     graphics::{CursorKind, Margin, Modifier, Rect},
+    view::ViewPosition,
     Document, DocumentId, Editor,
 };
 
@@ -178,7 +179,7 @@ impl<T: Item> FilePicker<T> {
                             }
                             _ => {
                                 // TODO: enable syntax highlighting; blocked by async rendering
-                                Document::open(path, None, None)
+                                Document::open(path, None, None, editor.config.clone())
                                     .map(|doc| CachedPreview::Document(Box::new(doc)))
                                     .unwrap_or(CachedPreview::NotFound)
                             }
@@ -282,24 +283,33 @@ impl<T: Item + 'static> Component for FilePicker<T> {
                 })
                 .unwrap_or(0);
 
-            let offset = Position::new(first_line, 0);
+            let offset = ViewPosition {
+                anchor: doc.text().line_to_char(first_line),
+                horizontal_offset: 0,
+                vertical_offset: 0,
+            };
 
-            let mut highlights =
-                EditorView::doc_syntax_highlights(doc, offset, area.height, &cx.editor.theme);
+            let mut highlights = EditorView::doc_syntax_highlights(
+                doc,
+                offset.anchor,
+                area.height,
+                &cx.editor.theme,
+            );
             for spans in EditorView::doc_diagnostics_highlights(doc, &cx.editor.theme) {
                 if spans.is_empty() {
                     continue;
                 }
                 highlights = Box::new(helix_core::syntax::merge(highlights, spans));
             }
-            EditorView::render_text_highlights(
+            render_document(
+                surface,
+                inner,
                 doc,
                 offset,
-                inner,
-                surface,
-                &cx.editor.theme,
+                &TextAnnotations::default(),
                 highlights,
-                &cx.editor.config(),
+                &cx.editor.theme,
+                &mut [],
             );
 
             // highlight the line

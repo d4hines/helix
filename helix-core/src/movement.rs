@@ -4,16 +4,18 @@ use ropey::iter::Chars;
 use tree_sitter::{Node, QueryCursor};
 
 use crate::{
+    char_idx_at_visual_offset,
     chars::{categorize_char, char_is_line_ending, CharCategory},
+    doc_formatter::TextFormat,
     graphemes::{
         next_grapheme_boundary, nth_next_grapheme_boundary, nth_prev_grapheme_boundary,
         prev_grapheme_boundary,
     },
     line_ending::rope_is_line_ending,
-    pos_at_visual_coords,
     syntax::LanguageConfiguration,
+    text_annotations::TextAnnotations,
     textobject::TextObject,
-    visual_coords_at_pos, Position, Range, RopeSlice,
+    visual_offset_from_block, Position, Range, RopeSlice,
 };
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -34,7 +36,8 @@ pub fn move_horizontally(
     dir: Direction,
     count: usize,
     behaviour: Movement,
-    _: usize,
+    _: TextFormat,
+    _: &mut TextAnnotations,
 ) -> Range {
     let pos = range.cursor(slice);
 
@@ -54,24 +57,26 @@ pub fn move_vertically(
     dir: Direction,
     count: usize,
     behaviour: Movement,
-    tab_width: usize,
+    config: TextFormat,
+    annotations: &mut TextAnnotations,
 ) -> Range {
+    annotations.clear_line_annotations();
     let pos = range.cursor(slice);
 
     // Compute the current position's 2d coordinates.
-    let Position { row, col } = visual_coords_at_pos(slice, pos, tab_width);
+    let Position { col, .. } = visual_offset_from_block(slice, pos, pos, config, annotations).0;
     let horiz = range.horiz.unwrap_or(col as u32);
 
     // Compute the new position.
-    let new_row = match dir {
-        Direction::Forward => (row + count).min(slice.len_lines().saturating_sub(1)),
-        Direction::Backward => row.saturating_sub(count),
-    };
     let new_col = col.max(horiz as usize);
-    let new_pos = pos_at_visual_coords(slice, Position::new(new_row, new_col), tab_width);
-
+    let row_off = match dir {
+        Direction::Forward => count as isize,
+        Direction::Backward => -(count as isize),
+    };
+    // TODO how to handle inline annotations that span an entire visual line
+    let new_pos = char_idx_at_visual_offset(slice, pos, row_off, new_col, config, annotations).0;
     // Special-case to avoid moving to the end of the last non-empty line.
-    if behaviour == Movement::Extend && slice.line(new_row).len_chars() == 0 {
+    if behaviour == Movement::Extend && slice.line(slice.char_to_line(new_pos)).len_chars() == 0 {
         return range;
     }
 
@@ -473,7 +478,16 @@ mod test {
         assert_eq!(
             coords_at_pos(
                 slice,
-                move_vertically(slice, range, Direction::Forward, 1, Movement::Move, 4).head
+                move_vertically(
+                    slice,
+                    range,
+                    Direction::Forward,
+                    1,
+                    Movement::Move,
+                    TextFormat::default(),
+                    &mut TextAnnotations::default()
+                )
+                .head
             ),
             (1, 3).into()
         );
@@ -497,7 +511,15 @@ mod test {
         ];
 
         for ((direction, amount), coordinates) in moves_and_expected_coordinates {
-            range = move_horizontally(slice, range, direction, amount, Movement::Move, 0);
+            range = move_horizontally(
+                slice,
+                range,
+                direction,
+                amount,
+                Movement::Move,
+                TextFormat::default(),
+                &mut TextAnnotations::default(),
+            );
             assert_eq!(coords_at_pos(slice, range.head), coordinates.into())
         }
     }
@@ -523,7 +545,15 @@ mod test {
         ];
 
         for ((direction, amount), coordinates) in moves_and_expected_coordinates {
-            range = move_horizontally(slice, range, direction, amount, Movement::Move, 0);
+            range = move_horizontally(
+                slice,
+                range,
+                direction,
+                amount,
+                Movement::Move,
+                TextFormat::default(),
+                &mut TextAnnotations::default(),
+            );
             assert_eq!(coords_at_pos(slice, range.head), coordinates.into());
             assert_eq!(range.head, range.anchor);
         }
@@ -545,7 +575,15 @@ mod test {
         ];
 
         for (direction, amount) in moves {
-            range = move_horizontally(slice, range, direction, amount, Movement::Extend, 0);
+            range = move_horizontally(
+                slice,
+                range,
+                direction,
+                amount,
+                Movement::Extend,
+                TextFormat::default(),
+                &mut TextAnnotations::default(),
+            );
             assert_eq!(range.anchor, original_anchor);
         }
     }
@@ -569,7 +607,15 @@ mod test {
         ];
 
         for ((direction, amount), coordinates) in moves_and_expected_coordinates {
-            range = move_vertically(slice, range, direction, amount, Movement::Move, 4);
+            range = move_vertically(
+                slice,
+                range,
+                direction,
+                amount,
+                Movement::Move,
+                TextFormat::default(),
+                &mut TextAnnotations::default(),
+            );
             assert_eq!(coords_at_pos(slice, range.head), coordinates.into());
             assert_eq!(range.head, range.anchor);
         }
@@ -603,8 +649,24 @@ mod test {
 
         for ((axis, direction, amount), coordinates) in moves_and_expected_coordinates {
             range = match axis {
-                Axis::H => move_horizontally(slice, range, direction, amount, Movement::Move, 0),
-                Axis::V => move_vertically(slice, range, direction, amount, Movement::Move, 4),
+                Axis::H => move_horizontally(
+                    slice,
+                    range,
+                    direction,
+                    amount,
+                    Movement::Move,
+                    TextFormat::default(),
+                    &mut TextAnnotations::default(),
+                ),
+                Axis::V => move_vertically(
+                    slice,
+                    range,
+                    direction,
+                    amount,
+                    Movement::Move,
+                    TextFormat::default(),
+                    &mut TextAnnotations::default(),
+                ),
             };
             assert_eq!(coords_at_pos(slice, range.head), coordinates.into());
             assert_eq!(range.head, range.anchor);
@@ -638,8 +700,24 @@ mod test {
 
         for ((axis, direction, amount), coordinates) in moves_and_expected_coordinates {
             range = match axis {
-                Axis::H => move_horizontally(slice, range, direction, amount, Movement::Move, 0),
-                Axis::V => move_vertically(slice, range, direction, amount, Movement::Move, 4),
+                Axis::H => move_horizontally(
+                    slice,
+                    range,
+                    direction,
+                    amount,
+                    Movement::Move,
+                    TextFormat::default(),
+                    &mut TextAnnotations::default(),
+                ),
+                Axis::V => move_vertically(
+                    slice,
+                    range,
+                    direction,
+                    amount,
+                    Movement::Move,
+                    TextFormat::default(),
+                    &mut TextAnnotations::default(),
+                ),
             };
             assert_eq!(coords_at_pos(slice, range.head), coordinates.into());
             assert_eq!(range.head, range.anchor);

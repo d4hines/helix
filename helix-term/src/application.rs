@@ -172,7 +172,7 @@ impl Application {
             area,
             theme_loader.clone(),
             syn_loader.clone(),
-            Box::new(Map::new(Arc::clone(&config), |config: &Config| {
+            Arc::new(Map::new(Arc::clone(&config), |config: &Config| {
                 &config.editor
             })),
         );

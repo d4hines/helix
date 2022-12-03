@@ -566,9 +566,9 @@ impl Selection {
     }
 
     /// Takes a closure and maps each `Range` over the closure.
-    pub fn transform<F>(mut self, f: F) -> Self
+    pub fn transform<F>(mut self, mut f: F) -> Self
     where
-        F: Fn(Range) -> Range,
+        F: FnMut(Range) -> Range,
     {
         for range in self.ranges.iter_mut() {
             *range = f(*range)

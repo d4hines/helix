@@ -9,7 +9,9 @@ use tui::text::Spans;
 pub use typed::*;
 
 use helix_core::{
-    comment, coords_at_pos, encoding, find_first_non_whitespace_char, find_root, graphemes,
+    char_idx_at_visual_offset, comment,
+    doc_formatter::TextFormat,
+    encoding, find_first_non_whitespace_char, find_root, graphemes,
     history::UndoKind,
     increment::date_time::DateTimeIncrementor,
     increment::{number::NumberIncrementor, Increment},
@@ -21,11 +23,13 @@ use helix_core::{
     object, pos_at_coords, pos_at_visual_coords,
     regex::{self, Regex, RegexBuilder},
     search::{self, CharMatcher},
-    selection, shellwords, surround, textobject,
+    selection, shellwords, surround,
+    text_annotations::TextAnnotations,
+    textobject,
     tree_sitter::Node,
     unicode::width::UnicodeWidthChar,
-    visual_coords_at_pos, LineEnding, Position, Range, Rope, RopeGraphemes, RopeSlice, Selection,
-    SmallVec, Tendril, Transaction,
+    visual_coords_at_pos, visual_offset_from_block, LineEnding, Position, Range, Rope,
+    RopeGraphemes, RopeSlice, Selection, SmallVec, Tendril, Transaction,
 };
 use helix_view::{
     apply_transaction,
@@ -528,18 +532,30 @@ impl PartialEq for MappableCommand {
 
 fn no_op(_cx: &mut Context) {}
 
-fn move_impl<F>(cx: &mut Context, move_fn: F, dir: Direction, behaviour: Movement)
-where
-    F: Fn(RopeSlice, Range, Direction, usize, Movement, usize) -> Range,
-{
+fn move_impl(
+    cx: &mut Context,
+    move_fn: fn(
+        RopeSlice,
+        Range,
+        Direction,
+        usize,
+        Movement,
+        TextFormat,
+        &mut TextAnnotations,
+    ) -> Range,
+    dir: Direction,
+    behaviour: Movement,
+) {
     let count = cx.count();
     let (view, doc) = current!(cx.editor);
     let text = doc.text().slice(..);
+    let config = doc.text_format(view.inner_area(doc).width);
+    let mut annotations = view.text_annotations(doc);
 
     let selection = doc
         .selection(view.id)
         .clone()
-        .transform(|range| move_fn(text, range, dir, count, behaviour, doc.tab_width()));
+        .transform(|range| move_fn(text, range, dir, count, behaviour, config, &mut annotations));
     doc.set_selection(view.id, selection);
 }
 
@@ -881,17 +897,22 @@ fn goto_window(cx: &mut Context, align: Align) {
     // as we type
     let scrolloff = config.scrolloff.min(height.saturating_sub(1) / 2);
 
-    let last_line = view.last_line(doc);
+    let last_visual_line = view.last_visual_line(doc);
 
-    let line = match align {
-        Align::Top => view.offset.row + scrolloff + count,
-        Align::Center => view.offset.row + ((last_line - view.offset.row) / 2),
-        Align::Bottom => last_line.saturating_sub(scrolloff + count),
+    let visual_line = match align {
+        Align::Top => view.offset.vertical_offset + scrolloff + count,
+        Align::Center => view.offset.vertical_offset + (last_visual_line / 2),
+        Align::Bottom => {
+            view.offset.vertical_offset + last_visual_line.saturating_sub(scrolloff + count)
+        }
     }
-    .max(view.offset.row + scrolloff)
-    .min(last_line.saturating_sub(scrolloff));
+    .max(view.offset.vertical_offset + scrolloff)
+    .min(view.offset.vertical_offset + last_visual_line.saturating_sub(scrolloff));
 
-    let pos = doc.text().line_to_char(line);
+    let pos = view
+        .pos_at_visual_coords(doc, visual_line as u16, 0, false)
+        .expect("visual_line was constrained to the view area");
+
     let text = doc.text().slice(..);
     let selection = doc
         .selection(view.id)
@@ -1375,53 +1396,72 @@ pub fn scroll(cx: &mut Context, offset: usize, direction: Direction) {
     let range = doc.selection(view.id).primary();
     let text = doc.text().slice(..);
 
-    let cursor = visual_coords_at_pos(text, range.cursor(text), doc.tab_width());
-    let doc_last_line = doc.text().len_lines().saturating_sub(1);
-
-    let last_line = view.last_line(doc);
-
-    if direction == Backward && view.offset.row == 0
-        || direction == Forward && last_line == doc_last_line
-    {
-        return;
-    }
-
+    let cursor = range.cursor(text);
     let height = view.inner_height();
 
     let scrolloff = config.scrolloff.min(height / 2);
+    let offset = match direction {
+        Forward => offset as isize,
+        Backward => -(offset as isize),
+    };
 
-    view.offset.row = match direction {
-        Forward => view.offset.row + offset,
-        Backward => view.offset.row.saturating_sub(offset),
+    let doc_text = doc.text().slice(..);
+    let viewport = view.inner_area(doc);
+    let text_fmt = doc.text_format(viewport.width);
+    let annotations = view.text_annotations(doc);
+    (view.offset.anchor, view.offset.vertical_offset) = char_idx_at_visual_offset(
+        doc_text,
+        view.offset.anchor,
+        view.offset.vertical_offset as isize + offset,
+        0,
+        text_fmt,
+        &annotations,
+    );
+
+    let head;
+    match direction {
+        Forward => {
+            head = char_idx_at_visual_offset(
+                doc_text,
+                view.offset.anchor,
+                (view.offset.vertical_offset + scrolloff) as isize,
+                0,
+                text_fmt,
+                &annotations,
+            )
+            .0;
+            if head <= cursor {
+                return;
+            }
+        }
+        Backward => {
+            head = char_idx_at_visual_offset(
+                doc_text,
+                view.offset.anchor,
+                (view.offset.vertical_offset + height - scrolloff) as isize,
+                0,
+                text_fmt,
+                &annotations,
+            )
+            .0;
+            if head >= cursor {
+                return;
+            }
+        }
     }
-    .min(doc_last_line);
 
-    // recalculate last line
-    let last_line = view.last_line(doc);
+    let anchor = if cx.editor.mode == Mode::Select {
+        range.anchor
+    } else {
+        head
+    };
 
-    // clamp into viewport
-    let line = cursor
-        .row
-        .max(view.offset.row + scrolloff)
-        .min(last_line.saturating_sub(scrolloff));
-
-    // If cursor needs moving, replace primary selection
-    if line != cursor.row {
-        let head = pos_at_visual_coords(text, Position::new(line, cursor.col), doc.tab_width()); // this func will properly truncate to line end
-
-        let anchor = if cx.editor.mode == Mode::Select {
-            range.anchor
-        } else {
-            head
-        };
-
-        // replace primary selection with an empty selection at cursor pos
-        let prim_sel = Range::new(anchor, head);
-        let mut sel = doc.selection(view.id).clone();
-        let idx = sel.primary_index();
-        sel = sel.replace(idx, prim_sel);
-        doc.set_selection(view.id, sel);
-    }
+    // replace primary selection with an empty selection at cursor pos
+    let prim_sel = Range::new(anchor, head);
+    let mut sel = doc.selection(view.id).clone();
+    let idx = sel.primary_index();
+    sel = sel.replace(idx, prim_sel);
+    doc.set_selection(view.id, sel);
 }
 
 fn page_up(cx: &mut Context) {
@@ -4437,11 +4477,18 @@ fn align_view_bottom(cx: &mut Context) {
 
 fn align_view_middle(cx: &mut Context) {
     let (view, doc) = current!(cx.editor);
-    let text = doc.text().slice(..);
-    let pos = doc.selection(view.id).primary().cursor(text);
-    let pos = coords_at_pos(text, pos);
+    let inner_width = view.inner_width(doc);
+    let text_fmt = doc.text_format(inner_width);
+    // there is no horizontal position when softwrap is enabled
+    if text_fmt.soft_wrap {
+        return;
+    }
+    let doc_text = doc.text().slice(..);
+    let annotations = view.text_annotations(doc);
+    let pos = doc.selection(view.id).primary().cursor(doc_text);
+    let pos = visual_offset_from_block(doc_text, view.offset.anchor, pos, text_fmt, &annotations).0;
 
-    view.offset.col = pos
+    view.offset.horizontal_offset = pos
         .col
         .saturating_sub((view.inner_area(doc).width as usize) / 2);
 }

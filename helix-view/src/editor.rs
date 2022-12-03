@@ -7,6 +7,7 @@ use crate::{
     input::KeyEvent,
     theme::{self, Theme},
     tree::{self, Tree},
+    view::ViewPosition,
     Align, Document, DocumentId, View, ViewId,
 };
 use helix_vcs::DiffProviderRegistry;
@@ -178,6 +179,44 @@ pub struct Config {
     pub indent_guides: IndentGuidesConfig,
     /// Whether to color modes with different colors. Defaults to `false`.
     pub color_modes: bool,
+    pub soft_wrap: SoftWrap,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
+pub struct SoftWrap {
+    /// Soft wrap lines that exceed viewport width. Default to off
+    pub enable: bool,
+    /// Maximum space that softwrapping may leave free at the end of the line when perfomring softwrapping
+    /// This space is used to wrap text at word boundries. If that is not possible within this limit
+    /// the word is simply split at the end of the line.
+    ///
+    /// This is automatically hardlimited to a quarter of the viewport to ensure correct display on small views.
+    ///
+    /// Default to 5
+    pub max_wrap: u16,
+    /// Maximum number of indentation that can be carried over from the previous line when softwrapping.
+    /// If a line is indenten further then this limit it is rendered at the start of the viewport instead.
+    ///
+    /// This is automatically hardlimited to a quarter of the viewport to ensure correct display on small views.
+    ///
+    /// Default to 40
+    pub max_indent_retain: u16,
+    /// Extra spaces inserted before rendeirng softwrapped lines.
+    ///
+    /// Default to 2
+    pub wrap_indent: u16,
+}
+
+impl Default for SoftWrap {
+    fn default() -> Self {
+        SoftWrap {
+            enable: false,
+            max_wrap: 5,
+            max_indent_retain: 80,
+            wrap_indent: 2,
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -633,6 +672,7 @@ impl Default for Config {
             bufferline: BufferLine::default(),
             indent_guides: IndentGuidesConfig::default(),
             color_modes: false,
+            soft_wrap: SoftWrap::default(),
         }
     }
 }
@@ -713,7 +753,7 @@ pub struct Editor {
     pub status_msg: Option<(Cow<'static, str>, Severity)>,
     pub autoinfo: Option<Info>,
 
-    pub config: Box<dyn DynAccess<Config>>,
+    pub config: Arc<dyn DynAccess<Config>>,
     pub auto_pairs: Option<AutoPairs>,
 
     pub idle_timer: Pin<Box<Sleep>>,
@@ -782,7 +822,7 @@ impl Editor {
         mut area: Rect,
         theme_loader: Arc<theme::Loader>,
         syn_loader: Arc<syntax::Loader>,
-        config: Box<dyn DynAccess<Config>>,
+        config: Arc<dyn DynAccess<Config>>,
     ) -> Self {
         let conf = config.load();
         let auto_pairs = (&conf.auto_pairs).into();
@@ -991,7 +1031,7 @@ impl Editor {
     fn replace_document_in_view(&mut self, current_view: ViewId, doc_id: DocumentId) {
         let view = self.tree.get_mut(current_view);
         view.doc = doc_id;
-        view.offset = Position::default();
+        view.offset = ViewPosition::default();
 
         let doc = doc_mut!(self, &doc_id);
         doc.ensure_view_init(view.id);
@@ -1118,12 +1158,15 @@ impl Editor {
     }
 
     pub fn new_file(&mut self, action: Action) -> DocumentId {
-        self.new_file_from_document(action, Document::default())
+        self.new_file_from_document(action, Document::default(self.config.clone()))
     }
 
     pub fn new_file_from_stdin(&mut self, action: Action) -> Result<DocumentId, Error> {
         let (rope, encoding) = crate::document::from_reader(&mut stdin(), None)?;
-        Ok(self.new_file_from_document(action, Document::from(rope, Some(encoding))))
+        Ok(self.new_file_from_document(
+            action,
+            Document::from(rope, Some(encoding), self.config.clone()),
+        ))
     }
 
     // ??? possible use for integration tests
@@ -1134,7 +1177,12 @@ impl Editor {
         let id = if let Some(id) = id {
             id
         } else {
-            let mut doc = Document::open(&path, None, Some(self.syn_loader.clone()))?;
+            let mut doc = Document::open(
+                &path,
+                None,
+                Some(self.syn_loader.clone()),
+                self.config.clone(),
+            )?;
 
             let _ = Self::launch_language_server(&mut self.language_servers, &mut doc);
             if let Some(diff_base) = self.diff_providers.get_diff_base(&path) {
@@ -1220,7 +1268,7 @@ impl Editor {
                 .iter()
                 .map(|(&doc_id, _)| doc_id)
                 .next()
-                .unwrap_or_else(|| self.new_document(Document::default()));
+                .unwrap_or_else(|| self.new_document(Document::default(self.config.clone())));
             let view = View::new(doc_id, self.config().gutters.clone());
             let view_id = self.tree.insert(view);
             let doc = doc_mut!(self, &doc_id);
