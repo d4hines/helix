@@ -104,6 +104,12 @@ warning = "yellow"
 info = "sky"
 hint = "teal"
 
+"ui.explorer.file" = { fg = "text" }
+"ui.explorer.dir" = { fg = "sapphire" }
+"ui.explorer.exe" = { fg = "rosewater" }
+"ui.explorer.focus" = { modifiers = ["reversed"] }
+"ui.explorer.unfocus" = { bg = "surface1" }
+
 [palette]
 # catppuccin palette colors
 rosewater = "#f2d5cf"
