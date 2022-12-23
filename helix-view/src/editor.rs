@@ -137,6 +137,7 @@ pub struct ExplorerConfig {
     pub position: ExplorerPosition,
     /// explorer column width
     pub column_width: usize,
+    pub exclude_directories: Vec<String>,
 }
 
 impl ExplorerConfig {
@@ -175,6 +176,7 @@ impl Default for ExplorerConfig {
             style: ExplorerStyle::Tree,
             position: ExplorerPosition::Overlay,
             column_width: 30,
+            exclude_directories: vec![".git".to_string()],
         }
     }
 }

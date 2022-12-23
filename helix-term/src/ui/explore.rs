@@ -147,7 +147,13 @@ impl TreeItem for FileInfo {
             _ => return Ok(vec![]),
         };
         let mut ret: Vec<_> = std::fs::read_dir(&self.path)?
-            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| match entry {
+                Ok(entry) => match entry.file_name().to_str() {
+                    Some(".git") => None,
+                    _ => Some(entry),
+                },
+                Err(_) => None,
+            })
             .filter_map(|entry| {
                 entry.metadata().ok().map(|meta| {
                     let is_exe = false;
