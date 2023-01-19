@@ -33,8 +33,8 @@ use std::{num::NonZeroUsize, path::PathBuf, rc::Rc};
 
 use tui::buffer::Buffer as Surface;
 
-use super::statusline;
-use super::{document::LineDecoration, lsp::SignatureHelp};
+use super::{document::LineDecoration, lsp::SignatureHelp, Explorer};
+use super::{overlay::Overlay, statusline};
 
 pub struct EditorView {
     pub keymaps: Keymaps,

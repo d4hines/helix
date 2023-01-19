@@ -245,6 +245,8 @@ pub struct Config {
     /// Whether to color modes with different colors. Defaults to `false`.
     pub color_modes: bool,
     pub soft_wrap: SoftWrap,
+    /// explore config
+    pub explorer: ExplorerConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -271,8 +273,6 @@ pub struct SoftWrap {
     ///
     /// Default to 2
     pub wrap_indent: u16,
-    /// explore config
-    pub explorer: ExplorerConfig,
 }
 
 impl Default for SoftWrap {
