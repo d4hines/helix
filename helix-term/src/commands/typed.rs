@@ -2734,6 +2734,124 @@ fn diff_open(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> an
     Ok(())
 }
 
+/// Build a read-only scratch document holding `bytes` (a VCS blob of `source`),
+/// with syntax highlighting detected from `source`'s file name and a display
+/// name like "default.nix (index)".
+fn git_scratch_document(
+    editor: &mut Editor,
+    bytes: Vec<u8>,
+    source: &std::path::Path,
+    label: &str,
+) -> anyhow::Result<helix_view::Document> {
+    let (text, encoding, has_bom) =
+        helix_view::document::read_to_string(&mut bytes.as_slice(), None)?;
+    let mut doc = helix_view::Document::from(
+        Rope::from(text),
+        Some((encoding, has_bom)),
+        editor.config.clone(),
+        editor.syn_loader.clone(),
+    );
+    let loader = editor.syn_loader.load_full();
+    let lang_config = loader
+        .language_for_filename(source)
+        .map(|lang| loader.language(lang).config().clone());
+    doc.set_language(lang_config, &loader);
+    doc.readonly = true;
+    let file_name = source
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_default();
+    doc.display_name_override = Some(format!("{file_name} ({label})"));
+    Ok(doc)
+}
+
+fn diff_git(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    if cx.editor.diff_session_for(cx.editor.tree.focus).is_some() {
+        bail!("This view is already in a diff session (:diff-off to end it)");
+    }
+
+    let staged = args.has_flag("staged");
+    let rev = args.first().map(str::to_owned);
+
+    let (_, doc) = current_ref!(cx.editor);
+    let Some(path) = doc.path().map(|p| p.to_path_buf()) else {
+        bail!(":diff-git requires the current buffer to be backed by a file");
+    };
+    let doc_orig = doc.id();
+
+    let workspace = path
+        .parent()
+        .map(|dir| helix_loader::find_workspace_in(dir).0)
+        .unwrap_or_else(|| helix_loader::find_workspace().0);
+    let trust_full = cx
+        .editor
+        .workspace_trust
+        .query(&workspace, helix_loader::workspace_trust::TrustQuery::Git)
+        .is_trusted();
+
+    use helix_vcs::FileRevision;
+    // Left side: what the buffer is compared against. Right side: the working
+    // tree (the live document) by default, or the index for --staged.
+    let (left_rev, left_label) = match (staged, rev.as_deref()) {
+        (false, None) => (FileRevision::Index, "index".to_string()),
+        (true, None) => (FileRevision::Head, "HEAD".to_string()),
+        (_, Some(spec)) => (FileRevision::Rev(spec), spec.to_string()),
+    };
+
+    let left_bytes = cx
+        .editor
+        .diff_providers
+        .get_file_at(&path, left_rev, trust_full)
+        .with_context(|| format!("unable to read '{left_label}' version of {}", path.display()))?;
+    let left_doc = git_scratch_document(cx.editor, left_bytes, &path, &left_label)?;
+
+    let right_doc = if staged {
+        let right_bytes = cx
+            .editor
+            .diff_providers
+            .get_file_at(&path, FileRevision::Index, trust_full)
+            .with_context(|| format!("unable to read index version of {}", path.display()))?;
+        Some(git_scratch_document(cx.editor, right_bytes, &path, "index")?)
+    } else {
+        None
+    };
+
+    let doc_a = cx.editor.new_file_from_document(Action::Replace, left_doc);
+    let view_a = cx.editor.tree.focus;
+
+    let (doc_b, right_label) = match right_doc {
+        Some(doc) => (
+            cx.editor.new_file_from_document(Action::VerticalSplit, doc),
+            "index",
+        ),
+        None => {
+            cx.editor.switch(doc_orig, Action::VerticalSplit);
+            (doc_orig, "working tree")
+        }
+    };
+    let view_b = cx.editor.tree.focus;
+
+    let rope_a = cx.editor.documents[&doc_a].text().clone();
+    let rope_b = cx.editor.documents[&doc_b].text().clone();
+
+    let mut session = helix_view::diff_session::DiffSession::new(view_a, view_b, doc_a, doc_b);
+    session.compute_hunks(&rope_a, &rope_b);
+    cx.editor.diff_sessions.push(session);
+
+    cx.editor.set_status(format!(
+        "Diff: {} ({left_label}) vs {right_label}",
+        path.file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default(),
+    ));
+
+    Ok(())
+}
+
 fn reset_diff_change(
     cx: &mut compositor::Context,
     _args: Args,
@@ -2761,6 +2879,9 @@ fn reset_diff_change(
         });
 
     if let Some((hunks, side, doc_curr_id, doc_partner_id)) = session_info {
+        if cx.editor.documents[&doc_curr_id].readonly {
+            bail!("Cannot modify a read-only diff pane");
+        }
         let curr_text = cx.editor.documents[&doc_curr_id].text().clone();
         let partner_text = cx.editor.documents[&doc_partner_id].text().clone();
         let line_ranges: Vec<(usize, usize)> = {
@@ -2867,6 +2988,10 @@ fn diff_put(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> an
     let Some((hunks, side, doc_curr_id, doc_partner_id, partner_view_id)) = session_info else {
         bail!("Not in a diff session");
     };
+
+    if cx.editor.documents[&doc_partner_id].readonly {
+        bail!("Cannot modify a read-only diff pane");
+    }
 
     let curr_text = cx.editor.documents[&doc_curr_id].text().clone();
     let partner_text = cx.editor.documents[&doc_partner_id].text().clone();
@@ -4214,6 +4339,23 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::positional(&[completers::filename, completers::filename]),
         signature: Signature {
             positionals: (2, Some(2)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "diff-git",
+        aliases: &["dgit"],
+        doc: "Diff the current file against git. With no arguments: working tree vs index (unstaged changes, right pane editable). With a revision: working tree vs that revision. With --staged: index vs HEAD (or the given revision).",
+        fun: diff_git,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(1)),
+            flags: &[Flag {
+                name: "staged",
+                alias: Some('s'),
+                doc: "diff the index against HEAD (staged changes)",
+                ..Flag::DEFAULT
+            }],
             ..Signature::DEFAULT
         },
     },

@@ -28,6 +28,12 @@ fn get_repo_dir(file: &Path) -> Result<&Path> {
 }
 
 pub fn get_diff_base(file: &Path, trust_full: bool) -> Result<Vec<u8>> {
+    get_file_at(file, crate::FileRevision::Head, trust_full)
+}
+
+/// Fetch the contents of `file` as stored at `rev`, converted to worktree
+/// encoding (filters like autocrlf applied).
+pub fn get_file_at(file: &Path, rev: crate::FileRevision, trust_full: bool) -> Result<Vec<u8>> {
     debug_assert!(!file.exists() || file.is_file());
     debug_assert!(file.is_absolute());
     let file = gix::path::realpath(file).context("resolve symlinks")?;
@@ -38,19 +44,37 @@ pub fn get_diff_base(file: &Path, trust_full: bool) -> Result<Vec<u8>> {
     let repo = open_repo(repo_dir, trust_full)
         .context("failed to open git repo")?
         .to_thread_local();
-    let head = repo.head_commit()?;
-    let file_oid = find_file_in_commit(&repo, &head, &file)?;
+
+    let file_oid = match rev {
+        crate::FileRevision::Head => {
+            let head = repo.head_commit()?;
+            find_file_in_commit(&repo, &head, &file)?
+        }
+        crate::FileRevision::Rev(spec) => {
+            let object = repo.rev_parse_single(spec)?.object()?;
+            let commit = object
+                .peel_to_kind(gix::object::Kind::Commit)
+                .with_context(|| format!("'{spec}' does not point to a commit"))?
+                .into_commit();
+            find_file_in_commit(&repo, &commit, &file)?
+        }
+        crate::FileRevision::Index => find_file_in_index(&repo, &file)?,
+    };
 
     let file_object = repo.find_object(file_oid)?;
     let data = file_object.detach().data;
-    // Get the actual data that git would make out of the git object.
-    // This will apply the user's git config or attributes like crlf conversions.
-    //
-    // The whole filter pipeline still runs in untrusted (`Trust::Reduced`) mode so built-in
-    // conversions like autocrlf keep working, but gix drops `filter.*.clean` / `filter.*.smudge`
-    // drivers defined in untrusted (repository-local) config, so those external programs are not
-    // executed unless the workspace was explicitly trusted. This relies on `open_repo` forcing the
-    // trust level instead of letting gix re-derive it from `.git` ownership; see the note there.
+    convert_to_worktree_encoding(&repo, &file, data)
+}
+
+/// Get the actual data that git would make out of the git object.
+/// This will apply the user's git config or attributes like crlf conversions.
+///
+/// The whole filter pipeline still runs in untrusted (`Trust::Reduced`) mode so built-in
+/// conversions like autocrlf keep working, but gix drops `filter.*.clean` / `filter.*.smudge`
+/// drivers defined in untrusted (repository-local) config, so those external programs are not
+/// executed unless the workspace was explicitly trusted. This relies on `open_repo` forcing the
+/// trust level instead of letting gix re-derive it from `.git` ownership; see the note there.
+fn convert_to_worktree_encoding(repo: &Repository, file: &Path, data: Vec<u8>) -> Result<Vec<u8>> {
     if let Some(work_dir) = repo.workdir() {
         let rela_path = file.strip_prefix(work_dir)?;
         let rela_path = gix::path::try_into_bstr(rela_path)?;
@@ -63,6 +87,20 @@ pub fn get_diff_base(file: &Path, trust_full: bool) -> Result<Vec<u8>> {
     } else {
         Ok(data)
     }
+}
+
+/// Finds the blob holding the contents of `file` in the repository's index.
+/// For conflicted paths there is no stage-0 entry; staged sides (base/ours/theirs)
+/// are not resolved here and the lookup fails.
+fn find_file_in_index(repo: &Repository, file: &Path) -> Result<ObjectId> {
+    let work_dir = repo.workdir().context("repo has no worktree")?;
+    let rel_path = file.strip_prefix(work_dir)?;
+    let rel_path = gix::path::try_into_bstr(rel_path)?;
+    let index = repo.index()?;
+    let entry = index
+        .entry_by_path(rel_path.as_ref())
+        .context("file is not in the index")?;
+    Ok(entry.id)
 }
 
 pub fn get_current_head_name(file: &Path, trust_full: bool) -> Result<Arc<ArcSwap<Box<str>>>> {

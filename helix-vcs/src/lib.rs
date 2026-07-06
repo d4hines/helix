@@ -20,6 +20,18 @@ mod status;
 
 pub use status::FileChange;
 
+/// Which stored version of a file to fetch from the VCS.
+#[derive(Debug, Clone, Copy)]
+pub enum FileRevision<'a> {
+    /// The version in the staging area (index).
+    Index,
+    /// The version in the current HEAD commit.
+    Head,
+    /// The version at an arbitrary revision, in whatever spec syntax the
+    /// provider understands (for git: commit hashes, refs, `HEAD~2`, ...).
+    Rev(&'a str),
+}
+
 /// Contains all active diff providers. Diff providers are compiled in via features. Currently
 /// only `git` is supported.
 #[derive(Clone)]
@@ -38,6 +50,23 @@ impl DiffProviderRegistry {
                 Err(err) => {
                     log::debug!("{err:#?}");
                     log::debug!("failed to open diff base for {}", file.display());
+                    None
+                }
+            })
+    }
+
+    /// Get the contents of `file` as stored at `rev`, converted to worktree
+    /// encoding. Returns `None` (with the error logged) when no provider can
+    /// resolve the revision, e.g. for files outside a repository or revisions
+    /// that don't contain the file.
+    pub fn get_file_at(&self, file: &Path, rev: FileRevision, trust_full: bool) -> Option<Vec<u8>> {
+        self.providers
+            .iter()
+            .find_map(|provider| match provider.get_file_at(file, rev, trust_full) {
+                Ok(res) => Some(res),
+                Err(err) => {
+                    log::debug!("{err:#?}");
+                    log::debug!("failed to get file at {rev:?} for {}", file.display());
                     None
                 }
             })
@@ -112,6 +141,17 @@ impl DiffProvider {
             #[cfg(feature = "git")]
             Self::Git => git::get_diff_base(file, trust_full),
             Self::None => bail!("No diff support compiled in"),
+        }
+    }
+
+    fn get_file_at(&self, file: &Path, rev: FileRevision, trust_full: bool) -> Result<Vec<u8>> {
+        match self {
+            #[cfg(feature = "git")]
+            Self::Git => git::get_file_at(file, rev, trust_full),
+            Self::None => {
+                let _ = rev;
+                bail!("No diff support compiled in")
+            }
         }
     }
 

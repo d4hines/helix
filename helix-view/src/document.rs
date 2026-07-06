@@ -214,6 +214,11 @@ pub struct Document {
 
     pub readonly: bool,
 
+    /// Overrides the name shown in the statusline/bufferline for documents
+    /// whose content doesn't come from a file path, e.g. a git blob shown in
+    /// a diff view ("default.nix (index)"). Takes precedence over the path.
+    pub display_name_override: Option<String>,
+
     pub previous_diagnostic_ids: HashMap<LanguageServerId, String>,
 
     /// Annotations for LSP document color swatches
@@ -764,6 +769,7 @@ impl Document {
             version_control_head: None,
             focused_at: std::time::Instant::now(),
             readonly: false,
+            display_name_override: None,
             jump_labels: HashMap::new(),
             document_highlights: HashMap::new(),
             code_action_hints: HashSet::new(),
@@ -2131,6 +2137,9 @@ impl Document {
     }
 
     pub fn display_name(&self) -> Cow<'_, str> {
+        if let Some(name) = &self.display_name_override {
+            return Cow::Owned(name.clone());
+        }
         self.relative_path()
             .map_or_else(|| SCRATCH_BUFFER_NAME.into(), |path| path.to_string_lossy())
     }
