@@ -66,6 +66,11 @@
 "diff.minus" = "red"
 "diff.delta" = "blue"
 
+"diff.plus.view" = { bg = "diff_plus_view" }
+"diff.minus.view" = { bg = "diff_minus_view" }
+"diff.delta.view" = { bg = "diff_delta_view" }
+"diff.delta.view.text" = { bg = "diff_delta_view_text" }
+
 # User Interface
 # --------------
 "ui.background" = { fg = "text", bg = "base" }
@@ -166,3 +171,9 @@ secondary_cursor = "#b5a6a8"
 secondary_cursor_select = "#878ec0"
 secondary_cursor_normal = "#b5a6a8"
 secondary_cursor_insert = "#7ea87f"
+
+# diff view line backgrounds: green/red/blue blended into base (20%, text 40%)
+diff_plus_view = "#394545"
+diff_minus_view = "#493446"
+diff_delta_view = "#333c57"
+diff_delta_view_text = "#495a80"

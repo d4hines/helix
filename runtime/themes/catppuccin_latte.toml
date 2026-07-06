@@ -33,3 +33,9 @@ secondary_cursor = "#e1a99d"
 secondary_cursor_select = "#97a7fb"
 secondary_cursor_normal = "#e1a99d"
 secondary_cursor_insert = "#74b867"
+
+# diff view line backgrounds: green/red/blue blended into base (20%, text 40%)
+diff_plus_view = "#cce1cd"
+diff_minus_view = "#e9c4cf"
+diff_delta_view = "#c5d5f5"
+diff_delta_view_text = "#9bb9f5"
