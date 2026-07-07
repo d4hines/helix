@@ -18,6 +18,8 @@ pub use diff::{DiffHandle, Hunk};
 
 mod status;
 
+pub mod stage;
+
 pub use status::FileChange;
 
 /// Which stored version of a file to fetch from the VCS.

@@ -406,7 +406,10 @@ fn hunks_intersecting<'a>(
         };
         line_ranges.iter().any(|(start, end)| {
             if curr_range.is_empty() {
-                curr_range.start as usize <= *end
+                // A pure deletion on this side anchors at `start` (the line
+                // just below the rendered gap): it matches only when the
+                // selection contains that anchor line.
+                *start <= curr_range.start as usize && curr_range.start as usize <= *end
             } else {
                 curr_range.start as usize <= *end && curr_range.end as usize > *start
             }
@@ -1682,6 +1685,26 @@ mod tests {
         assert_eq!(changes, 1);
         // After diffget on side B: doc_b gains line2 back from doc_a.
         assert_eq!(apply_tx(&rope_b, tx), rope_a);
+    }
+
+    #[test]
+    fn deletion_anchored_above_selection_does_not_intersect() {
+        // doc_a: a b c d e f; doc_b: a c d e F. Two hunks on side B: a pure
+        // deletion anchored at after-line 1, and the f->F change at line 4.
+        // A selection on line 4 only must not pull the unrelated deletion.
+        let mut session = make_session();
+        let rope_a = Rope::from("a\nb\nc\nd\ne\nf\n");
+        let rope_b = Rope::from("a\nc\nd\ne\nF\n");
+        session.compute_hunks(&rope_a, &rope_b);
+        assert_eq!(session.hunks().len(), 2);
+
+        let line_ranges = vec![(4usize, 4usize)];
+        let (tx, changes) =
+            build_get_transaction(session.hunks(), DiffSide::B, &line_ranges, &rope_b, &rope_a);
+
+        assert_eq!(changes, 1);
+        // Only f is reverted; "b" stays deleted.
+        assert_eq!(apply_tx(&rope_b, tx), Rope::from("a\nc\nd\ne\nf\n"));
     }
 
     #[test]

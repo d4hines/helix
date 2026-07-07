@@ -27,3 +27,22 @@ for the full spec.
   scratch diff panes show "app.nix (index)" instead of "[scratch]". The
   `file-base-name` element keeps its path-derived behavior unless an override
   is set.
+
+## P2a: staging semantics (property-tested before implementation)
+
+- **Selection→hunk matching**: non-empty hunks match on real line overlap; a
+  pure deletion anchors at `after.start` (where the gutter renders its mark /
+  the gap sits) and is selected only when the selection contains that line.
+  Selecting the line above the gap does NOT stage the deletion.
+- **Fixed a #15631 bug** (upstream-worthy): `hunks_intersecting` in
+  diff_session.rs matched pure deletions anywhere above the selection's end,
+  so `:diffget` with a selection on lines 10-12 would also pull a deletion
+  anchored at line 2. Canonical helix-vcs semantics restored + regression test.
+- **Write path**: full-content index writes (`git hash-object -w --stdin
+  --path` + `git update-index --add --cacheinfo`), VS Code's approach — no
+  patch application, no context matching. `--path` means clean/CRLF filters
+  apply as if the content came from the worktree.
+- **Property suite** (helix-vcs/tests/staging.rs): empty/full selection
+  identities, random hunk subsets vs an independent byte-splicing reference,
+  stage∘unstage identity, git CLI round-trips incl. no-trailing-newline and
+  partial-stage MM status. proptest added as helix-vcs dev-dependency.
