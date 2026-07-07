@@ -146,3 +146,12 @@ for the full spec.
   with quiet counts,  branch header with ahead/behind + fetch freshness and
   a hairline rule. Diff-coloring unit tests updated to pin the new semantics.
 - Pane titles shorten full 40-char shas to 7.
+
+## Storybook
+
+- The parity artifact now carries a **storybook** (canonical HTML mocks of the
+  chosen system: S1 diff pair, S2 panel rows, S3 footers, S4 pickers, S5 pane
+  titles, S6 color tokens) plus a deviation ledger. Rule: implementation is
+  held against the storybook; visual changes update the storybook FIRST, then
+  the code. Cursor-row inline action hints implemented to close the ledger's
+  gap.

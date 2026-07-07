@@ -794,6 +794,20 @@ impl GitPanel {
                         );
                     }
 
+                    // Inline action hints on the cursor row (storybook S2),
+                    // drawn over the directory tail when space is tight.
+                    if is_cursor && self.focused && self.pending_discard.is_none() {
+                        let hint = match file.section {
+                            Section::Staged => "[u]nstage",
+                            Section::Unstaged => "[s]tage [d]iscard",
+                        };
+                        let hint_len = hint.chars().count() as u16;
+                        let hint_x = letter_x.saturating_sub(hint_len + 1);
+                        if hint_x > after_name + 1 {
+                            surface.set_string(hint_x, y, hint, dim.patch(row_style));
+                        }
+                    }
+
                     // status letter (also the mouse target for stage/unstage)
                     let letter_style = match file.letter {
                         'A' | 'U' => plus,
