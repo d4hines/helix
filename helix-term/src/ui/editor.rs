@@ -426,6 +426,10 @@ impl EditorView {
             decorations,
         );
 
+        if let Some((side, _, ref hunks, _, _)) = diff_view_info {
+            Self::render_diff_map(doc, view, side, hunks, surface, theme);
+        }
+
         // if we're not at the edge of the screen, draw a right border
         if viewport.right() != view.area.right() {
             let x = area.right();
@@ -453,6 +457,68 @@ impl EditorView {
             statusline::RenderContext::new(editor, doc, view, is_focused, &self.spinners);
 
         statusline::render(&mut context, statusline_area, surface);
+    }
+
+    /// Render the diff-map column: a 1-cell overview strip in the view's
+    /// reserved rightmost column showing hunk positions scaled across the
+    /// whole file (VS Code's overview ruler), plus a scroll thumb for the
+    /// visible range. The column is reserved by `View::inner_area` while the
+    /// view is part of a diff session.
+    fn render_diff_map(
+        doc: &Document,
+        view: &View,
+        side: helix_view::diff_session::DiffSide,
+        hunks: &[helix_vcs::Hunk],
+        surface: &mut Surface,
+        theme: &Theme,
+    ) {
+        use helix_view::diff_session::DiffSide;
+        let inner = view.inner_area(doc);
+        if inner.height == 0 || !view.diff_map {
+            return;
+        }
+        let x = inner.x + inner.width;
+        let height = inner.height as usize;
+        let text = doc.text().slice(..);
+        let total = text.len_lines().max(1);
+        let row_of = |line: usize| -> u16 { ((line * height / total).min(height - 1)) as u16 };
+
+        // Scroll thumb: rows covering the visible doc-line range.
+        let anchor = doc.view_offset(view.id).anchor.min(text.len_chars());
+        let first = text.char_to_line(anchor);
+        let last = view.estimate_last_doc_line(doc);
+        let thumb_style = theme.get("ui.menu.scroll");
+        for row in row_of(first)..=row_of(last) {
+            surface.set_string(x, inner.y + row, "▏", thumb_style);
+        }
+
+        // Hunk marks, colored by change kind with the diff gutter palette.
+        let plus = theme.get("diff.plus");
+        let minus = theme.get("diff.minus");
+        let delta = theme.get("diff.delta");
+        for hunk in hunks {
+            let my_range = match side {
+                DiffSide::A => &hunk.before,
+                DiffSide::B => &hunk.after,
+            };
+            let style = if hunk.before.is_empty() {
+                plus
+            } else if hunk.after.is_empty() {
+                minus
+            } else {
+                delta
+            };
+            let (start, end) = if my_range.is_empty() {
+                // Pure deletion on this side: mark the line below the gap,
+                // where the gutter renders its deletion indicator.
+                (my_range.start as usize, my_range.start as usize)
+            } else {
+                (my_range.start as usize, my_range.end as usize - 1)
+            };
+            for row in row_of(start)..=row_of(end) {
+                surface.set_string(x, inner.y + row, "▐", style);
+            }
+        }
     }
 
     pub fn render_rulers(

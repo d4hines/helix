@@ -172,6 +172,9 @@ pub struct View {
     // left to future work. For now we treat all views as focused and give them
     // each their own handler.
     pub diagnostics_handler: DiagnosticsHandler,
+    /// Reserve the rightmost column for the diff-map (hunk overview marks +
+    /// scroll position) while this view is part of a diff session.
+    pub diff_map: bool,
 }
 
 impl fmt::Debug for View {
@@ -197,6 +200,7 @@ impl View {
             gutters,
             doc_revisions: HashMap::new(),
             diagnostics_handler: DiagnosticsHandler::new(),
+            diff_map: false,
         }
     }
 
@@ -208,7 +212,12 @@ impl View {
     }
 
     pub fn inner_area(&self, doc: &Document) -> Rect {
-        self.area.clip_left(self.gutter_offset(doc)).clip_bottom(1) // -1 for statusline
+        let area = self.area.clip_left(self.gutter_offset(doc)).clip_bottom(1); // -1 for statusline
+        if self.diff_map {
+            area.clip_right(1) // -1 for the diff-map column
+        } else {
+            area
+        }
     }
 
     pub fn inner_height(&self) -> usize {
@@ -216,7 +225,12 @@ impl View {
     }
 
     pub fn inner_width(&self, doc: &Document) -> u16 {
-        self.area.clip_left(self.gutter_offset(doc)).width
+        let width = self.area.clip_left(self.gutter_offset(doc)).width;
+        if self.diff_map {
+            width.saturating_sub(1)
+        } else {
+            width
+        }
     }
 
     pub fn gutters(&self) -> &[GutterType] {

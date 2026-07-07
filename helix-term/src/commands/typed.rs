@@ -2725,6 +2725,8 @@ fn diff_open(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> an
     session.compute_hunks(&rope_a, &rope_b);
 
     cx.editor.diff_sessions.push(session);
+    cx.editor.tree.get_mut(view_a).diff_map = true;
+    cx.editor.tree.get_mut(view_b).diff_map = true;
     cx.editor.set_status(format!(
         "Diff: {} vs {}",
         path_a.display(),
@@ -3153,6 +3155,8 @@ fn diff_git(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> any
         }
     }
     cx.editor.diff_sessions.push(session);
+    cx.editor.tree.get_mut(view_a).diff_map = true;
+    cx.editor.tree.get_mut(view_b).diff_map = true;
 
     cx.editor.set_status(format!(
         "Diff: {} ({left_label}) vs {right_label}",
@@ -3345,17 +3349,11 @@ fn diff_off(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> an
     }
 
     let view_id = cx.editor.tree.focus;
-    let idx = cx
-        .editor
-        .diff_sessions
-        .iter()
-        .position(|s| s.contains_view(view_id));
-
-    let Some(idx) = idx else {
+    if cx.editor.diff_session_for(view_id).is_none() {
         bail!("Not in a diff session");
-    };
+    }
 
-    cx.editor.diff_sessions.remove(idx);
+    cx.editor.remove_diff_sessions(|s| s.contains_view(view_id));
     cx.editor.set_status("Diff session ended");
     Ok(())
 }
@@ -3399,6 +3397,8 @@ fn diff_this(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> a
             );
             session.compute_hunks(&rope_a, &rope_b);
             cx.editor.diff_sessions.push(session);
+            cx.editor.tree.get_mut(other_view_id).diff_map = true;
+            cx.editor.tree.get_mut(view_id).diff_map = true;
             cx.editor.set_status("Diff session started.");
         }
     }

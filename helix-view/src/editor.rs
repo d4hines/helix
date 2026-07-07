@@ -2150,6 +2150,26 @@ impl Editor {
         Ok(id)
     }
 
+    /// Remove every diff session matching `pred`, releasing the diff-map
+    /// column on any surviving views that belonged to those sessions.
+    pub fn remove_diff_sessions(&mut self, pred: impl Fn(&crate::diff_session::DiffSession) -> bool) {
+        let mut freed_views = Vec::new();
+        self.diff_sessions.retain(|s| {
+            if pred(s) {
+                freed_views.push(s.view_a());
+                freed_views.push(s.view_b());
+                false
+            } else {
+                true
+            }
+        });
+        for view_id in freed_views {
+            if self.tree.try_get(view_id).is_some() {
+                self.tree.get_mut(view_id).diff_map = false;
+            }
+        }
+    }
+
     pub fn close(&mut self, id: ViewId) {
         // Remove selections for the closed view on all documents.
         for doc in self.documents_mut() {
@@ -2157,7 +2177,7 @@ impl Editor {
         }
         self.tree.remove(id);
         // Prune any diff sessions whose view or pending marker matches the closed view.
-        self.diff_sessions.retain(|s| !s.contains_view(id));
+        self.remove_diff_sessions(|s| s.contains_view(id));
         if self.pending_diff_this == Some(id) {
             self.pending_diff_this = None;
         }
@@ -2176,7 +2196,7 @@ impl Editor {
         // This will also disallow any follow-up writes
         self.saves.remove(&doc_id);
         // Prune any diff sessions that reference the document being closed.
-        self.diff_sessions.retain(|s| !s.contains_doc(doc_id));
+        self.remove_diff_sessions(|s| s.contains_doc(doc_id));
 
         enum Action {
             Close(ViewId),

@@ -67,3 +67,15 @@ for the full spec.
   :stage-file (no index entry to partially stage against).
 - **No default keybindings yet** — typed commands only. Keys land with the
   status panel phase so the whole map is designed at once.
+
+## P2c: diff-map column
+
+- 1-cell overview strip at each diff pane's right edge: hunk marks (▐) scaled
+  to file length, colored with the diff gutter palette (plus/minus/delta), and
+  a scroll thumb (▏, `ui.menu.scroll` style) for the visible range — VS Code's
+  overview ruler equivalent, doubling as the "did I miss a change?" guarantee.
+- The column is reserved via `View::inner_area` behind a `View::diff_map`
+  flag, so softwrap widths, mouse mapping, scrolloff, and alignment fillers all
+  stay consistent. Flag lifecycle: set on session creation, cleared by
+  `Editor::remove_diff_sessions` (used by :diff-off and view/doc close paths).
+- Not yet clickable (click-to-jump is a later nicety).
