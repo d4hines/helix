@@ -61,6 +61,8 @@ fn file_icon(name: &str) -> (&'static str, helix_view::theme::Color) {
 pub enum Section {
     Staged,
     Unstaged,
+    /// Files of the commit shown in commit mode.
+    Files,
 }
 
 #[derive(Debug, Clone)]
@@ -78,6 +80,8 @@ enum Row {
     Blank,
     Section(Section),
     File(usize),
+    /// Dim metadata line in commit mode (index into commit meta rendering).
+    Meta(usize),
 }
 
 pub struct GitPanel {
@@ -102,6 +106,48 @@ pub struct GitPanel {
     error: Option<String>,
     /// When the last `F` fetch completed, for the header's freshness note.
     last_fetch: Option<std::time::Instant>,
+    mode: PanelMode,
+    /// Set while in commit mode.
+    commit: Option<CommitInfo>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PanelMode {
+    Status,
+    Commit,
+}
+
+#[derive(Debug, Clone)]
+struct CommitInfo {
+    /// The rev as given (sha, ref, or stash@{n}).
+    rev: String,
+    short: String,
+    subject: String,
+    /// "Author · relative age"
+    author_line: String,
+    files_n: usize,
+    insertions: usize,
+    deletions: usize,
+}
+
+/// Open (or reuse) the git panel and switch it to the commit view for `rev`.
+pub fn show_commit_view(
+    editor: &mut Editor,
+    compositor: &mut crate::compositor::Compositor,
+    workdir: PathBuf,
+    rev: String,
+) {
+    let Some(editor_view) = compositor.find::<ui::EditorView>() else {
+        return;
+    };
+    if editor_view.git_panel.is_none() {
+        editor_view.git_panel = Some(GitPanel::new(workdir));
+    }
+    let panel = editor_view.git_panel.as_mut().expect("just ensured");
+    match panel.show_commit(&rev) {
+        Ok(()) => panel.focused = true,
+        Err(err) => editor.set_error(err.to_string()),
+    }
 }
 
 impl GitPanel {
@@ -122,14 +168,24 @@ impl GitPanel {
             pending_discard: None,
             error: None,
             last_fetch: None,
+            mode: PanelMode::Status,
+            commit: None,
         };
         panel.refresh();
         panel
     }
 
-    /// Re-read `git status` and rebuild the rows. Clears marks and any
-    /// pending confirmation.
+    /// Re-read the panel's data (git status, or the shown commit) and
+    /// rebuild the rows. Clears marks and any pending confirmation.
     pub fn refresh(&mut self) {
+        if self.mode == PanelMode::Commit {
+            if let Some(rev) = self.commit.as_ref().map(|c| c.rev.clone()) {
+                if let Err(err) = self.show_commit(&rev) {
+                    self.error = Some(err.to_string());
+                }
+                return;
+            }
+        }
         self.marked.clear();
         self.pending_discard = None;
         self.error = None;
@@ -145,6 +201,84 @@ impl GitPanel {
             }
         }
         self.rebuild_rows();
+    }
+
+    /// Switch to commit mode showing `rev`'s metadata and files.
+    pub fn show_commit(&mut self, rev: &str) -> anyhow::Result<()> {
+        let meta = helix_vcs::stage::run_git(
+            &self.workdir,
+            &[
+                "show",
+                "--no-patch",
+                "--format=%h\u{1f}%an\u{1f}%cr\u{1f}%s",
+                rev,
+            ],
+            None,
+        )?;
+        let mut fields = meta.lines().last().unwrap_or_default().split('\u{1f}');
+        let short = fields.next().unwrap_or_default().to_string();
+        let author = fields.next().unwrap_or_default();
+        let age = fields.next().unwrap_or_default();
+        let subject = fields.next().unwrap_or_default().to_string();
+
+        let stat = helix_vcs::stage::run_git(
+            &self.workdir,
+            &["show", "--format=", "--shortstat", rev],
+            None,
+        )?;
+        let (mut files_n, mut insertions, mut deletions) = (0usize, 0usize, 0usize);
+        for part in stat.trim().split(", ") {
+            let n: usize = part
+                .split_whitespace()
+                .next()
+                .and_then(|w| w.parse().ok())
+                .unwrap_or(0);
+            if part.contains("file") {
+                files_n = n;
+            } else if part.contains("insertion") {
+                insertions = n;
+            } else if part.contains("deletion") {
+                deletions = n;
+            }
+        }
+
+        let names = helix_vcs::stage::run_git(
+            &self.workdir,
+            &["show", "--format=", "--name-status", "-z", rev],
+            None,
+        )?;
+        self.files = commands::parse_name_status(&names)
+            .into_iter()
+            .map(|item| FileItem {
+                rela: item.rela,
+                letter: item.status,
+                section: Section::Files,
+            })
+            .collect();
+
+        self.commit = Some(CommitInfo {
+            rev: rev.to_string(),
+            short,
+            subject,
+            author_line: format!("{author} · {age}"),
+            files_n,
+            insertions,
+            deletions,
+        });
+        self.mode = PanelMode::Commit;
+        self.marked.clear();
+        self.pending_discard = None;
+        self.error = None;
+        self.scroll = 0;
+        self.rebuild_rows();
+        Ok(())
+    }
+
+    /// Leave commit mode and return to the status view.
+    fn exit_commit(&mut self) {
+        self.mode = PanelMode::Status;
+        self.commit = None;
+        self.refresh();
     }
 
     fn parse_status(&mut self, input: &str) {
@@ -233,6 +367,27 @@ impl GitPanel {
 
     fn rebuild_rows(&mut self) {
         self.rows.clear();
+        if self.mode == PanelMode::Commit {
+            // Header (sha + subject), hairline slot, two meta lines, files.
+            self.rows.push(Row::Header);
+            self.rows.push(Row::Blank);
+            self.rows.push(Row::Meta(0));
+            self.rows.push(Row::Meta(1));
+            self.rows.push(Row::Blank);
+            self.rows.push(Row::Section(Section::Files));
+            for i in 0..self.files.len() {
+                self.rows.push(Row::File(i));
+            }
+            if !self.row_is_file(self.cursor) {
+                self.cursor = self
+                    .rows
+                    .iter()
+                    .position(|r| matches!(r, Row::File(_)))
+                    .unwrap_or(0);
+            }
+            self.cursor = self.cursor.min(self.rows.len().saturating_sub(1));
+            return;
+        }
         self.rows.push(Row::Header);
         if self.section_len(Section::Staged) > 0 {
             self.rows.push(Row::Blank);
@@ -415,6 +570,18 @@ impl GitPanel {
     /// Enter / click on a file name: open the most useful view for the entry.
     fn open_entry(&mut self, editor: &mut Editor, file_idx: usize) {
         let file = self.files[file_idx].clone();
+        if self.mode == PanelMode::Commit {
+            let Some(rev) = self.commit.as_ref().map(|c| c.rev.clone()) else {
+                return;
+            };
+            self.focused = false;
+            let item = commands::CommitFileItem {
+                status: file.letter,
+                rela: file.rela,
+            };
+            commands::open_commit_file(editor, &self.workdir.clone(), &item, &rev);
+            return;
+        }
         let abs = self.workdir.join(&file.rela);
         self.focused = false;
         let result = match (file.section, file.letter) {
@@ -445,6 +612,8 @@ impl GitPanel {
                 &abs,
                 commands::typed::GitDiffMode::Staged,
             ),
+            // Commit-mode entries are handled by the early return above.
+            (Section::Files, _) => return,
         };
         if let Err(err) = result {
             editor.set_error(err.to_string());
@@ -552,6 +721,24 @@ impl GitPanel {
             return;
         }
 
+        if self.mode == PanelMode::Commit {
+            match key.code {
+                KeyCode::Char('j') | KeyCode::Down => self.cursor_move(true),
+                KeyCode::Char('k') | KeyCode::Up => self.cursor_move(false),
+                KeyCode::Char('g') => self.cursor_to_edge(false),
+                KeyCode::Char('G') => self.cursor_to_edge(true),
+                KeyCode::Enter => {
+                    if let Some(i) = self.file_at(self.cursor) {
+                        self.open_entry(cx.editor, i);
+                    }
+                }
+                KeyCode::Char('R') => self.refresh(),
+                KeyCode::Char('q') | KeyCode::Esc => self.exit_commit(),
+                _ => {}
+            }
+            return;
+        }
+
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => self.cursor_move(true),
             KeyCode::Char('k') | KeyCode::Up => self.cursor_move(false),
@@ -601,7 +788,7 @@ impl GitPanel {
                     // The status letter cell toggles stage/unstage; the rest
                     // of the row opens the entry (VS Code single-click).
                     let letter_x = self.area.x + self.area.width - 3;
-                    if col == letter_x || col == letter_x + 1 {
+                    if (col == letter_x || col == letter_x + 1) && self.mode == PanelMode::Status {
                         let unstage = self.files[i].section == Section::Staged;
                         self.marked.clear();
                         self.marked.insert(i);
@@ -671,6 +858,65 @@ impl GitPanel {
             let y = area.y + screen_row as u16;
             match self.rows[row_idx] {
                 Row::Blank => {}
+                Row::Header if self.mode == PanelMode::Commit => {
+                    // " caea3fe re-add doomed" with a hairline below.
+                    if let Some(commit) = &self.commit {
+                        surface.set_stringn(
+                            area.x,
+                            y,
+                            &format!(" {}", commit.short),
+                            content_width,
+                            dim,
+                        );
+                        let off = 2 + commit.short.chars().count() as u16;
+                        if (off as usize) < content_width {
+                            surface.set_stringn(
+                                area.x + off,
+                                y,
+                                &commit.subject,
+                                content_width - off as usize,
+                                text,
+                            );
+                        }
+                    }
+                    if screen_row + 1 < height {
+                        surface.set_stringn(
+                            area.x,
+                            y + 1,
+                            &"─".repeat(content_width),
+                            content_width,
+                            border,
+                        );
+                    }
+                }
+                Row::Meta(idx) => {
+                    let Some(commit) = &self.commit else { continue };
+                    match idx {
+                        0 => {
+                            surface.set_stringn(
+                                area.x,
+                                y,
+                                &format!(" {}", commit.author_line),
+                                content_width,
+                                dim,
+                            );
+                        }
+                        _ => {
+                            // "3 files · +12 −4" with colored counts
+                            let files_part = format!(
+                                " {} file{} · ",
+                                commit.files_n,
+                                if commit.files_n == 1 { "" } else { "s" }
+                            );
+                            surface.set_stringn(area.x, y, &files_part, content_width, dim);
+                            let mut x = area.x + files_part.chars().count() as u16;
+                            let ins = format!("+{}", commit.insertions);
+                            surface.set_string(x, y, &ins, plus);
+                            x += ins.chars().count() as u16 + 1;
+                            surface.set_string(x, y, &format!("−{}", commit.deletions), minus);
+                        }
+                    }
+                }
                 Row::Header => {
                     // "  master ↑1 ↓0 · fetched 2m ago" with a hairline below.
                     let branch_style = theme.get("keyword").patch(base);
@@ -721,6 +967,7 @@ impl GitPanel {
                     let (label, count) = match section {
                         Section::Staged => ("STAGED CHANGES", self.section_len(Section::Staged)),
                         Section::Unstaged => ("CHANGES", self.section_len(Section::Unstaged)),
+                        Section::Files => ("FILES", self.section_len(Section::Files)),
                     };
                     surface.set_stringn(area.x, y, &format!(" {label}"), content_width, dim);
                     let label_cols = 1 + label.chars().count() as u16;
@@ -800,6 +1047,7 @@ impl GitPanel {
                         let hint = match file.section {
                             Section::Staged => "[u]nstage",
                             Section::Unstaged => "[s]tage [d]iscard",
+                            Section::Files => "[⏎] diff",
                         };
                         let hint_len = hint.chars().count() as u16;
                         let hint_x = letter_x.saturating_sub(hint_len + 1);
@@ -843,13 +1091,11 @@ impl GitPanel {
                 theme.get("error"),
             );
         } else if self.focused {
-            surface.set_stringn(
-                area.x,
-                footer_y,
-                " s:stage u:unstage d:discard c:commit",
-                content_width,
-                dim,
-            );
+            let hints = match self.mode {
+                PanelMode::Commit => " ⏎ diff · q back · R refresh",
+                PanelMode::Status => " s:stage u:unstage d:discard c:commit",
+            };
+            surface.set_stringn(area.x, footer_y, hints, content_width, dim);
         }
     }
 }

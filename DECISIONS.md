@@ -155,3 +155,18 @@ for the full spec.
   held against the storybook; visual changes update the storybook FIRST, then
   the code. Cursor-row inline action hints implemented to close the ledger's
   gap.
+
+## Commit view (panel commit mode)
+
+- The panel gains a commit mode (storybook S7): short sha + subject header,
+  hairline, "Author · age" and "N files · +X −Y" (colored) meta lines, FILES
+  section with standard row styling. Enter/click opens the file's parent↔rev
+  diff; q/Esc returns to the status view; R refreshes; staging keys inert.
+- Entry points: `:commit-show [rev]` (default HEAD), Enter in the commit log
+  picker, Enter in the stash picker (stash refs are commits). The transient
+  files-in-commit picker was removed in favor of the view.
+- Pane-title sha shortening now preserves ^/~ suffixes (`caea3fe^`).
+- The parity artifact gained a **gallery**: 11 live captures (panel, unstaged/
+  staged diffs, log/history/stash pickers, commit view + per-commit diff,
+  compare, discard confirm, commit prompt) so the whole surface can be
+  evaluated at a glance without opening hx.

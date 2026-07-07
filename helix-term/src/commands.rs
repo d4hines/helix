@@ -3609,13 +3609,13 @@ struct CommitPickerData {
 
 /// One file touched by a commit (or a ref↔worktree comparison).
 #[derive(Debug, Clone)]
-struct CommitFileItem {
-    status: char,
+pub(crate) struct CommitFileItem {
+    pub(crate) status: char,
     /// Repo-relative path (rename target for renames).
-    rela: String,
+    pub(crate) rela: String,
 }
 
-fn parse_name_status(output: &str) -> Vec<CommitFileItem> {
+pub(crate) fn parse_name_status(output: &str) -> Vec<CommitFileItem> {
     let mut items = Vec::new();
     let mut toks = output.split('\0').filter(|t| !t.is_empty());
     while let Some(status_tok) = toks.next() {
@@ -3640,7 +3640,12 @@ fn parse_name_status(output: &str) -> Vec<CommitFileItem> {
 
 /// Open the right view for a file of `commit`: rev^ ↔ rev diff for
 /// modifications, the blob itself for additions/deletions.
-fn open_commit_file(editor: &mut Editor, workdir: &Path, item: &CommitFileItem, commit: &str) {
+pub(crate) fn open_commit_file(
+    editor: &mut Editor,
+    workdir: &Path,
+    item: &CommitFileItem,
+    commit: &str,
+) {
     let abs = workdir.join(&item.rela);
     let parent = format!("{commit}^");
     let result = match item.status {
@@ -3657,75 +3662,6 @@ fn open_commit_file(editor: &mut Editor, workdir: &Path, item: &CommitFileItem, 
     if let Err(err) = result {
         editor.set_error(err.to_string());
     }
-}
-
-/// Picker over the files of `commit` (any committish, including stash refs);
-/// Enter opens the per-file diff against the commit's parent.
-fn push_commit_files_picker(
-    editor: &mut Editor,
-    compositor: &mut Compositor,
-    workdir: PathBuf,
-    commit: String,
-) {
-    let output = match helix_vcs::stage::run_git(
-        &workdir,
-        &["show", "--format=", "--name-status", "-z", &commit],
-        None,
-    ) {
-        Ok(out) => out,
-        Err(err) => {
-            editor.set_error(err.to_string());
-            return;
-        }
-    };
-    let files = parse_name_status(&output);
-    if files.is_empty() {
-        editor.set_error(format!("{commit}: no files changed"));
-        return;
-    }
-
-    let added = editor.theme.get("diff.plus");
-    let modified = editor.theme.get("diff.delta");
-    let deleted = editor.theme.get("diff.minus");
-
-    struct Data {
-        style_added: Style,
-        style_modified: Style,
-        style_deleted: Style,
-        workdir: PathBuf,
-        commit: String,
-    }
-    let columns = [
-        PickerColumn::new("status", |item: &CommitFileItem, data: &Data| {
-            let style = match item.status {
-                'A' => data.style_added,
-                'D' => data.style_deleted,
-                _ => data.style_modified,
-            };
-            Span::styled(item.status.to_string(), style).into()
-        }),
-        PickerColumn::new("path", |item: &CommitFileItem, _data: &Data| {
-            item.rela.clone().into()
-        }),
-    ];
-    let action_workdir = workdir.clone();
-    let action_commit = commit.clone();
-    let picker = Picker::new(
-        columns,
-        1,
-        files,
-        Data {
-            style_added: added,
-            style_modified: modified,
-            style_deleted: deleted,
-            workdir,
-            commit,
-        },
-        move |cx, item: &CommitFileItem, _action| {
-            open_commit_file(cx.editor, &action_workdir, item, &action_commit);
-        },
-    );
-    compositor.push(Box::new(overlaid(picker)));
 }
 
 /// Picker over files differing between `target` (a ref) and the working
@@ -3919,13 +3855,15 @@ fn git_log_impl(cx: &mut Context, path: Option<PathBuf>) {
                     };
                     open_commit_file(cx.editor, &action_workdir, &item, &sha);
                 }
-                // Repo log: drill into the commit's file list.
+                // Repo log: open the commit view.
                 None => {
                     let workdir = action_workdir.clone();
                     cx.jobs.callback(async move {
                         let call: job::Callback = job::Callback::EditorCompositor(Box::new(
                             move |editor: &mut Editor, compositor: &mut Compositor| {
-                                push_commit_files_picker(editor, compositor, workdir, sha);
+                                crate::ui::git_panel::show_commit_view(
+                                    editor, compositor, workdir, sha,
+                                );
                             },
                         ));
                         Ok(call)
@@ -4010,7 +3948,7 @@ fn git_stash_picker(cx: &mut Context) {
             cx.jobs.callback(async move {
                 let call: job::Callback = job::Callback::EditorCompositor(Box::new(
                     move |editor: &mut Editor, compositor: &mut Compositor| {
-                        push_commit_files_picker(editor, compositor, workdir, refname);
+                        crate::ui::git_panel::show_commit_view(editor, compositor, workdir, refname);
                     },
                 ));
                 Ok(call)

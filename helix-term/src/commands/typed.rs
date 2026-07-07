@@ -3015,11 +3015,16 @@ fn git_scratch_document(
         .file_name()
         .map(|n| n.to_string_lossy())
         .unwrap_or_default();
-    // Full commit hashes are noise in a pane title; show the short form.
-    let label = if label.len() == 40 && label.bytes().all(|b| b.is_ascii_hexdigit()) {
-        &label[..7]
+    // Full commit hashes are noise in a pane title; show the short form,
+    // preserving any ^/~ suffix (e.g. "<sha>^" from per-commit diffs).
+    let hash_len = label
+        .bytes()
+        .take_while(|b| b.is_ascii_hexdigit())
+        .count();
+    let label = if hash_len == 40 {
+        format!("{}{}", &label[..7], &label[40..])
     } else {
-        label
+        label.to_string()
     };
     doc.display_name_override = Some(format!("{file_name} ({label})"));
     Ok(doc)
@@ -3242,6 +3247,28 @@ fn git_stash_drop(
         return Ok(());
     }
     git_stash_op(cx, args, "drop")
+}
+
+/// Open the commit view (panel commit mode) for a revision, default HEAD.
+fn commit_show(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    let rev = args
+        .first()
+        .map(str::to_owned)
+        .unwrap_or_else(|| "HEAD".to_string());
+    let workdir = helix_vcs::stage::repo_workdir(&helix_stdx::env::current_working_dir())?;
+    let callback = async move {
+        let call: job::Callback = Callback::EditorCompositor(Box::new(
+            move |editor: &mut Editor, compositor: &mut Compositor| {
+                crate::ui::git_panel::show_commit_view(editor, compositor, workdir, rev);
+            },
+        ));
+        Ok(call)
+    };
+    cx.jobs.callback(callback);
+    Ok(())
 }
 
 fn git_panel(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow::Result<()> {
@@ -4967,6 +4994,17 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         aliases: &[],
         doc: "Drop a stash (default stash@{0}).",
         fun: git_stash_drop,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(1)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "commit-show",
+        aliases: &[],
+        doc: "Open the commit view for a revision (default HEAD): metadata, filestat, and per-file diffs.",
+        fun: commit_show,
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(1)),
