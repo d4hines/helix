@@ -170,3 +170,20 @@ for the full spec.
   staged diffs, log/history/stash pickers, commit view + per-commit diff,
   compare, discard confirm, commit prompt) so the whole surface can be
   evaluated at a glance without opening hx.
+
+## VS Code grounding pass (screenshot + pixel-sampled)
+
+- Drove the real VS Code (his install, catppuccin frappe) on the test repo via
+  AppleScript, screenshotted the SCM view and diff editor, and pixel-sampled
+  the exact colors. Findings adopted:
+  - Diff tints were too timid: removal line #6a4d5b (≈32%) / word #765666
+    (≈42%), addition line #4b555c (≈25%) / word #5e6f65 (≈40%) — frappe gets
+    the sampled values verbatim, other variants matching fractions.
+  - Hatch stripe: VS Code's #4e5369 vs our #4c5166 — already matched.
+  - Overview ruler: VS Code splits red-left/green-right — our design ✓.
+  - Added: −/+ markers in the gutter padding cell on changed diff lines;
+    pill count badges (reverse-video), Title-Case section labels, and
+    strikethrough deleted filenames in the panel.
+- Accepted deviations (ledger): no always-visible commit input (c-prompt
+  instead; an inert input would lie in a TUI); hover hunk-count and inline
+  blame queued with the blame phase.

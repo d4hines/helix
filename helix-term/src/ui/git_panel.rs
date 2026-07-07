@@ -965,18 +965,19 @@ impl GitPanel {
                 }
                 Row::Section(section) => {
                     let (label, count) = match section {
-                        Section::Staged => ("STAGED CHANGES", self.section_len(Section::Staged)),
-                        Section::Unstaged => ("CHANGES", self.section_len(Section::Unstaged)),
-                        Section::Files => ("FILES", self.section_len(Section::Files)),
+                        Section::Staged => ("Staged Changes", self.section_len(Section::Staged)),
+                        Section::Unstaged => ("Changes", self.section_len(Section::Unstaged)),
+                        Section::Files => ("Files", self.section_len(Section::Files)),
                     };
-                    surface.set_stringn(area.x, y, &format!(" {label}"), content_width, dim);
+                    surface.set_stringn(area.x, y, &format!(" {label}"), content_width, text);
                     let label_cols = 1 + label.chars().count() as u16;
+                    // count badge as a pill (reverse video, VS Code style)
                     surface.set_stringn(
                         area.x + label_cols + 1,
                         y,
-                        &count.to_string(),
+                        &format!(" {count} "),
                         content_width.saturating_sub(label_cols as usize + 1),
-                        text,
+                        dim.add_modifier(Modifier::REVERSED),
                     );
                 }
                 Row::File(i) => {
@@ -1028,7 +1029,13 @@ impl GitPanel {
                         .unwrap_or_default();
                     let name_x = area.x + 4;
                     let max_name = content_width.saturating_sub(6);
-                    surface.set_stringn(name_x, y, &name, max_name, text.patch(row_style));
+                    // Deleted entries render struck through, like VS Code.
+                    let name_style = if file.letter == 'D' {
+                        text.add_modifier(Modifier::CROSSED_OUT).patch(row_style)
+                    } else {
+                        text.patch(row_style)
+                    };
+                    surface.set_stringn(name_x, y, &name, max_name, name_style);
                     let after_name = name_x + (name.chars().count().min(max_name)) as u16;
                     let letter_x = area.x + area.width - 3;
                     if !dir.is_empty() && after_name + 2 < letter_x {

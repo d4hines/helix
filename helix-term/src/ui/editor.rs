@@ -206,6 +206,9 @@ impl EditorView {
                 diff_view_line_style(theme, "diff.delta")
                     .unwrap_or_else(|| Style::default().fg(Color::Rgb(111, 68, 240))),
             );
+            let sign_deleted =
+                Style::default().fg(theme.get("diff.minus").fg.unwrap_or(Color::Red));
+            let sign_added = Style::default().fg(theme.get("diff.plus").fg.unwrap_or(Color::Green));
 
             let mut cursor: usize = 0;
             let line_decoration = move |renderer: &mut TextRenderer, pos: LinePos| {
@@ -244,6 +247,20 @@ impl EditorView {
                         );
                         renderer
                             .set_style(Rect::new(inner.x, pos.visual_line, inner.width, 1), style);
+                        // VS Code-style +/− marker in the gutter padding cell
+                        // next to the line number, on the first visual line.
+                        if pos.first_visual_line && inner.x > 0 {
+                            let (glyph, marker_style) = match side {
+                                helix_view::diff_session::DiffSide::A => ("−", sign_deleted),
+                                helix_view::diff_session::DiffSide::B => ("+", sign_added),
+                            };
+                            renderer.set_string(
+                                inner.x - 1,
+                                pos.visual_line,
+                                glyph,
+                                marker_style,
+                            );
+                        }
                     }
                 }
             };
