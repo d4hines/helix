@@ -3013,6 +3013,41 @@ fn git_scratch_document(
     Ok(doc)
 }
 
+/// Open a read-only scratch buffer with the contents of a file as stored at a
+/// revision (default HEAD). Works for files deleted from the working tree.
+fn git_open(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let mut args = args.into_iter();
+    let path = match args.next() {
+        Some(arg) => helix_stdx::path::canonicalize(helix_stdx::path::expand_tilde(
+            std::path::Path::new(arg.as_ref()),
+        )),
+        None => {
+            let (_, doc) = current_ref!(cx.editor);
+            doc.path()
+                .map(|p| p.to_path_buf())
+                .context("current buffer is not backed by a file")?
+        }
+    };
+    let rev = args
+        .next()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "HEAD".to_string());
+
+    let trust_full = git_trust(cx.editor, &path);
+    let bytes = cx
+        .editor
+        .diff_providers
+        .get_file_at(&path, helix_vcs::FileRevision::Rev(&rev), trust_full)
+        .with_context(|| format!("unable to read '{rev}' version of {}", path.display()))?;
+    let doc = git_scratch_document(cx.editor, bytes, &path, &rev)?;
+    cx.editor.new_file_from_document(Action::Replace, doc);
+    Ok(())
+}
+
 fn diff_git(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
     if event != PromptEvent::Validate {
         return Ok(());
@@ -3023,7 +3058,10 @@ fn diff_git(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> any
     }
 
     let staged = args.has_flag("staged");
-    let rev = args.first().map(str::to_owned);
+    let revs: Vec<String> = args.into_iter().map(|s| s.to_string()).collect();
+    if staged && revs.len() > 1 {
+        bail!("--staged takes at most one revision");
+    }
 
     let (_, doc) = current_ref!(cx.editor);
     let Some(path) = doc.path().map(|p| p.to_path_buf()) else {
@@ -3035,11 +3073,18 @@ fn diff_git(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> any
 
     use helix_vcs::FileRevision;
     // Left side: what the buffer is compared against. Right side: the working
-    // tree (the live document) by default, or the index for --staged.
-    let (left_rev, left_label) = match (staged, rev.as_deref()) {
+    // tree (the live document) by default, the index for --staged, or a second
+    // revision for `:diff-git rev1 rev2`.
+    let (left_rev, left_label) = match (staged, revs.first().map(String::as_str)) {
         (false, None) => (FileRevision::Index, "index".to_string()),
         (true, None) => (FileRevision::Head, "HEAD".to_string()),
         (_, Some(spec)) => (FileRevision::Rev(spec), spec.to_string()),
+    };
+    let right_rev = if staged {
+        Some((FileRevision::Index, "index".to_string()))
+    } else {
+        revs.get(1)
+            .map(|spec| (FileRevision::Rev(spec), spec.clone()))
     };
 
     let left_bytes = cx
@@ -3049,15 +3094,18 @@ fn diff_git(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> any
         .with_context(|| format!("unable to read '{left_label}' version of {}", path.display()))?;
     let left_doc = git_scratch_document(cx.editor, left_bytes, &path, &left_label)?;
 
-    let right_doc = if staged {
-        let right_bytes = cx
-            .editor
-            .diff_providers
-            .get_file_at(&path, FileRevision::Index, trust_full)
-            .with_context(|| format!("unable to read index version of {}", path.display()))?;
-        Some(git_scratch_document(cx.editor, right_bytes, &path, "index")?)
-    } else {
-        None
+    let right_doc = match &right_rev {
+        Some((rev, label)) => {
+            let bytes = cx
+                .editor
+                .diff_providers
+                .get_file_at(&path, *rev, trust_full)
+                .with_context(|| {
+                    format!("unable to read '{label}' version of {}", path.display())
+                })?;
+            Some(git_scratch_document(cx.editor, bytes, &path, label)?)
+        }
+        None => None,
     };
 
     let doc_a = cx.editor.new_file_from_document(Action::Replace, left_doc);
@@ -3066,11 +3114,14 @@ fn diff_git(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> any
     let (doc_b, right_label) = match right_doc {
         Some(doc) => (
             cx.editor.new_file_from_document(Action::VerticalSplit, doc),
-            "index",
+            right_rev
+                .as_ref()
+                .map(|(_, label)| label.clone())
+                .unwrap_or_default(),
         ),
         None => {
             cx.editor.switch(doc_orig, Action::VerticalSplit);
-            (doc_orig, "working tree")
+            (doc_orig, "working tree".to_string())
         }
     };
     let view_b = cx.editor.tree.focus;
@@ -3082,15 +3133,15 @@ fn diff_git(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> any
     session.compute_hunks(&rope_a, &rope_b);
     {
         use helix_view::diff_session::{GitDiffContext, GitPane};
-        let left_pane = match left_rev {
+        let to_pane = |rev: &FileRevision| match rev {
             FileRevision::Index => GitPane::Index,
             FileRevision::Head => GitPane::Rev("HEAD".to_string()),
             FileRevision::Rev(spec) => GitPane::Rev(spec.to_string()),
         };
-        let right_pane = if staged {
-            GitPane::Index
-        } else {
-            GitPane::WorkingTree
+        let left_pane = to_pane(&left_rev);
+        let right_pane = match &right_rev {
+            Some((rev, _)) => to_pane(rev),
+            None => GitPane::WorkingTree,
         };
         if let Ok(workdir) = helix_vcs::stage::repo_workdir(&path) {
             session.git = Some(GitDiffContext {
@@ -4606,17 +4657,28 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     TypableCommand {
         name: "diff-git",
         aliases: &["dgit"],
-        doc: "Diff the current file against git. With no arguments: working tree vs index (unstaged changes, right pane editable). With a revision: working tree vs that revision. With --staged: index vs HEAD (or the given revision).",
+        doc: "Diff the current file against git. No arguments: working tree vs index (unstaged changes, right pane editable). One revision: working tree vs that revision. Two revisions: rev1 vs rev2. --staged: index vs HEAD (or the given revision).",
         fun: diff_git,
         completer: CommandCompleter::none(),
         signature: Signature {
-            positionals: (0, Some(1)),
+            positionals: (0, Some(2)),
             flags: &[Flag {
                 name: "staged",
                 alias: Some('s'),
                 doc: "diff the index against HEAD (staged changes)",
                 ..Flag::DEFAULT
             }],
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "git-open",
+        aliases: &[],
+        doc: "Open a file's content at a git revision (default HEAD) in a read-only buffer. Works for deleted files: :git-open <path> [rev]",
+        fun: git_open,
+        completer: CommandCompleter::positional(&[completers::filename]),
+        signature: Signature {
+            positionals: (0, Some(2)),
             ..Signature::DEFAULT
         },
     },

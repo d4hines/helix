@@ -32,11 +32,21 @@ pub fn get_diff_base(file: &Path, trust_full: bool) -> Result<Vec<u8>> {
 }
 
 /// Fetch the contents of `file` as stored at `rev`, converted to worktree
-/// encoding (filters like autocrlf applied).
+/// encoding (filters like autocrlf applied). `file` does not need to exist in
+/// the working tree (e.g. deleted files still readable from HEAD).
 pub fn get_file_at(file: &Path, rev: crate::FileRevision, trust_full: bool) -> Result<Vec<u8>> {
     debug_assert!(!file.exists() || file.is_file());
     debug_assert!(file.is_absolute());
-    let file = gix::path::realpath(file).context("resolve symlinks")?;
+    let file = if file.exists() {
+        gix::path::realpath(file).context("resolve symlinks")?
+    } else {
+        // Deleted files can't be canonicalized directly; resolve the parent.
+        let parent = file.parent().context("file has no parent directory")?;
+        let name = file.file_name().context("file has no name")?;
+        gix::path::realpath(parent)
+            .context("resolve symlinks")?
+            .join(name)
+    };
 
     // TODO cache repository lookup
 
