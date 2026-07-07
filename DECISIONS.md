@@ -46,3 +46,24 @@ for the full spec.
   identities, random hunk subsets vs an independent byte-splicing reference,
   stage∘unstage identity, git CLI round-trips incl. no-trailing-newline and
   partial-stage MM status. proptest added as helix-vcs dev-dependency.
+
+## P2b: staging commands
+
+- **`:stage-selection` (alias `:stage`)** works in ANY file-backed buffer, not
+  just diff views: it always reads the index fresh from git, diffs it against
+  the live buffer, and stages the hunks under the selection. A bare cursor
+  stages the hunk under it — so there is no separate stage-hunk command.
+- **`:unstage-selection` (alias `:unstage`)** is only valid in the index pane
+  of `:diff-git --staged`, mirroring VS Code (unstaging needs HEAD↔index
+  coordinates). It uses the session's displayed ropes/hunks so what you see is
+  what gets unstaged; if the user edited the (soft) read-only HEAD pane, the
+  reverted content is whatever is displayed — their own index, recoverable.
+- **`:stage-file` / `:unstage-file`**: `git add` / `git reset -q HEAD --`,
+  current buffer's file or an explicit path argument.
+- After any staging op, open diff panes showing the index for that file are
+  refreshed in place (hunks recompute automatically).
+- **UTF-8 only** for selection staging (content is recomposed via ropes);
+  non-UTF8 encodings bail with a clear error. Untracked files bail toward
+  :stage-file (no index entry to partially stage against).
+- **No default keybindings yet** — typed commands only. Keys land with the
+  status panel phase so the whole map is designed at once.

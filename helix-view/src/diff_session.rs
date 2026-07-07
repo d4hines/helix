@@ -105,6 +105,31 @@ fn word_token_char_starts(text: &str) -> Vec<usize> {
     starts
 }
 
+/// What a pane of a git-backed diff session displays.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitPane {
+    /// The live working-tree document.
+    WorkingTree,
+    /// A scratch snapshot of the index (staging area).
+    Index,
+    /// A scratch snapshot of a committed revision (HEAD or an explicit spec).
+    Rev(String),
+}
+
+/// Git metadata for a diff session opened via `:diff-git`, enabling staging
+/// operations to know which file/repo the panes describe.
+#[derive(Debug, Clone)]
+pub struct GitDiffContext {
+    /// Absolute path of the file in the working tree.
+    pub path: std::path::PathBuf,
+    /// Repository worktree root.
+    pub workdir: std::path::PathBuf,
+    /// What pane A (left) holds.
+    pub left: GitPane,
+    /// What pane B (right) holds.
+    pub right: GitPane,
+}
+
 /// A diff session pairs two views for side-by-side diff comparison.
 /// It holds the computed hunks between their documents and coordinates
 /// scroll synchronization and alignment.
@@ -114,6 +139,8 @@ pub struct DiffSession {
     view_b: ViewId,
     doc_a: DocumentId,
     doc_b: DocumentId,
+    /// Set when this session was opened against git targets (`:diff-git`).
+    pub git: Option<GitDiffContext>,
     /// Shared hunk list. Stored as Arc so callers can take a cheap reference-counted
     /// snapshot for closures and annotations without cloning the full Vec each frame.
     hunks: Arc<Vec<Hunk>>,
@@ -133,6 +160,7 @@ impl DiffSession {
             view_b,
             doc_a,
             doc_b,
+            git: None,
             hunks: Arc::new(Vec::new()),
             intra_line_cache: Arc::new(Vec::new()),
             version_a: None,

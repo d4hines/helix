@@ -13,42 +13,13 @@
 //! uses (ropey `lines()`, Histogram algorithm), so line indices here mean the
 //! same thing they mean in production.
 
-use helix_core::{Rope, RopeSlice};
+use helix_core::Rope;
 use helix_vcs::stage::{
-    apply_selected_hunks, hunk_selected, revert_selected_hunks, write_index_content, SelectionSide,
+    apply_selected_hunks, diff_hunks as compute_hunks, hunk_selected, revert_selected_hunks,
+    write_index_content, SelectionSide,
 };
 use helix_vcs::Hunk;
-use imara_diff::{Algorithm, Diff, InternedInput};
 use proptest::prelude::*;
-
-struct RopeLines<'a>(RopeSlice<'a>);
-
-impl<'a> imara_diff::TokenSource for RopeLines<'a> {
-    type Token = RopeSlice<'a>;
-    type Tokenizer = helix_core::ropey::iter::Lines<'a>;
-
-    fn tokenize(&self) -> Self::Tokenizer {
-        self.0.lines()
-    }
-
-    fn estimate_tokens(&self) -> u32 {
-        self.0.len_lines() as u32
-    }
-}
-
-/// Compute hunks exactly as `DiffSession::compute_hunks` does.
-fn compute_hunks(before: &Rope, after: &Rope) -> Vec<Hunk> {
-    let input = InternedInput::new(RopeLines(before.slice(..)), RopeLines(after.slice(..)));
-    let mut diff = Diff::compute(Algorithm::Histogram, &input);
-    diff.postprocess_with(
-        &input.before,
-        &input.after,
-        imara_diff::IndentHeuristic::new(|token| {
-            imara_diff::IndentLevel::for_ascii_line(input.interner[token].bytes(), 4)
-        }),
-    );
-    diff.hunks().collect()
-}
 
 /// Byte offsets of each ropey-style line start, with a final sentinel at
 /// `len`. `starts[i]` is where line `i` begins; `starts[len_lines]` == len.

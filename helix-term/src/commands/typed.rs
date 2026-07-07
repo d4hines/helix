@@ -2734,6 +2734,254 @@ fn diff_open(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> an
     Ok(())
 }
 
+/// Whether git operations may trust repository-local config for `path`'s
+/// workspace (filters etc.), per the workspace-trust store.
+fn git_trust(editor: &Editor, path: &std::path::Path) -> bool {
+    let workspace = path
+        .parent()
+        .map(|dir| helix_loader::find_workspace_in(dir).0)
+        .unwrap_or_else(|| helix_loader::find_workspace().0);
+    editor
+        .workspace_trust
+        .query(&workspace, helix_loader::workspace_trust::TrustQuery::Git)
+        .is_trusted()
+}
+
+/// Replace the contents of every open diff-session pane that displays the
+/// index version of `path` with `new_index`, keeping views in sync after a
+/// staging operation.
+fn refresh_index_panes(editor: &mut Editor, path: &std::path::Path, new_index: &Rope) {
+    use helix_view::diff_session::GitPane;
+    let targets: Vec<_> = editor
+        .diff_sessions
+        .iter()
+        .filter_map(|s| {
+            let git = s.git.as_ref()?;
+            if git.path != path {
+                return None;
+            }
+            if git.left == GitPane::Index {
+                Some((s.doc_a(), s.view_a()))
+            } else if git.right == GitPane::Index {
+                Some((s.doc_b(), s.view_b()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    for (doc_id, view_id) in targets {
+        let Some(doc) = editor.documents.get_mut(&doc_id) else {
+            continue;
+        };
+        let text: Tendril = new_index.slice(..).chunks().collect();
+        let transaction = Transaction::change(
+            doc.text(),
+            std::iter::once((0, doc.text().len_chars(), Some(text))),
+        );
+        doc.apply(&transaction, view_id);
+    }
+}
+
+/// Re-read the index version of `path` from git and refresh any panes
+/// displaying it. Used after whole-file staging operations where the new
+/// index content isn't already in memory.
+fn refresh_index_panes_from_git(editor: &mut Editor, path: &std::path::Path, trust_full: bool) {
+    if let Some(bytes) =
+        editor
+            .diff_providers
+            .get_file_at(path, helix_vcs::FileRevision::Index, trust_full)
+    {
+        if let Ok((text, ..)) = helix_view::document::read_to_string(&mut bytes.as_slice(), None) {
+            refresh_index_panes(editor, path, &Rope::from(text));
+        }
+    }
+}
+
+/// Stage exactly the selected lines of the current (file-backed) buffer:
+/// compute the new index content from the index↔worktree diff restricted to
+/// the selection, and write it to the index. Cursor-only selections stage the
+/// hunk under the cursor.
+fn stage_selection(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let (view, doc) = current_ref!(cx.editor);
+    let Some(path) = doc.path().map(|p| p.to_path_buf()) else {
+        bail!("Staging requires a file-backed buffer; select in the working-tree pane");
+    };
+    if doc.encoding() != helix_core::encoding::UTF_8 {
+        bail!("Staging selections currently requires a UTF-8 encoded document");
+    }
+    let worktree = doc.text().clone();
+    let ranges: Vec<(usize, usize)> = doc
+        .selection(view.id)
+        .line_ranges(worktree.slice(..))
+        .collect();
+
+    let trust_full = git_trust(cx.editor, &path);
+    let index_bytes = cx
+        .editor
+        .diff_providers
+        .get_file_at(&path, helix_vcs::FileRevision::Index, trust_full)
+        .with_context(|| {
+            format!(
+                "{} is not in the index (untracked or conflicted); use :stage-file for new files",
+                path.display()
+            )
+        })?;
+    let (index_text, ..) = helix_view::document::read_to_string(&mut index_bytes.as_slice(), None)?;
+    let index_rope = Rope::from(index_text);
+
+    let hunks = helix_vcs::stage::diff_hunks(&index_rope, &worktree);
+    let selected = hunks
+        .iter()
+        .filter(|h| helix_vcs::stage::hunk_selected(&h.after, &ranges))
+        .count();
+    if selected == 0 {
+        bail!("No unstaged changes under the selection");
+    }
+
+    let new_index = helix_vcs::stage::apply_selected_hunks(
+        &index_rope,
+        &worktree,
+        &hunks,
+        &ranges,
+        helix_vcs::stage::SelectionSide::After,
+    );
+
+    let workdir = helix_vcs::stage::repo_workdir(&path)?;
+    let rela = path.strip_prefix(&workdir)?.to_path_buf();
+    helix_vcs::stage::write_index_content(&workdir, &rela, new_index.to_string().as_bytes())?;
+
+    refresh_index_panes(cx.editor, &path, &new_index);
+    cx.editor.set_status(format!(
+        "Staged {selected} change{}",
+        if selected == 1 { "" } else { "s" }
+    ));
+    Ok(())
+}
+
+/// Unstage the selected lines. Must be run from the index pane of a staged
+/// diff view (`:diff-git --staged`): the selected hunks of the HEAD↔index
+/// diff are reverted in the index.
+fn unstage_selection(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    use helix_view::diff_session::{DiffSide, GitPane};
+    let view_id = cx.editor.tree.focus;
+    let session_info = cx.editor.diff_session_for(view_id).and_then(|s| {
+        let git = s.git.as_ref()?;
+        Some((
+            s.hunks_arc(),
+            s.side_for_view(view_id)?,
+            s.doc_a(),
+            s.doc_b(),
+            git.left.clone(),
+            git.right.clone(),
+            git.path.clone(),
+            git.workdir.clone(),
+        ))
+    });
+    let Some((hunks, side, doc_a, doc_b, left, right, path, workdir)) = session_info else {
+        bail!("Unstaging requires the staged diff view (:diff-git --staged)");
+    };
+    if left != GitPane::Rev("HEAD".to_string()) || right != GitPane::Index {
+        bail!("Unstaging requires the HEAD vs index view (:diff-git --staged)");
+    }
+    if side != DiffSide::B {
+        bail!("Select in the index pane (right side) to unstage");
+    }
+
+    let head_rope = cx.editor.documents[&doc_a].text().clone();
+    let index_rope = cx.editor.documents[&doc_b].text().clone();
+    let ranges: Vec<(usize, usize)> = {
+        let doc = &cx.editor.documents[&doc_b];
+        doc.selection(view_id)
+            .line_ranges(index_rope.slice(..))
+            .collect()
+    };
+
+    let selected = hunks
+        .iter()
+        .filter(|h| helix_vcs::stage::hunk_selected(&h.after, &ranges))
+        .count();
+    if selected == 0 {
+        bail!("No staged changes under the selection");
+    }
+
+    let new_index = helix_vcs::stage::revert_selected_hunks(
+        &head_rope,
+        &index_rope,
+        &hunks,
+        &ranges,
+        helix_vcs::stage::SelectionSide::After,
+    );
+
+    let rela = path.strip_prefix(&workdir)?.to_path_buf();
+    helix_vcs::stage::write_index_content(&workdir, &rela, new_index.to_string().as_bytes())?;
+
+    refresh_index_panes(cx.editor, &path, &new_index);
+    cx.editor.set_status(format!(
+        "Unstaged {selected} change{}",
+        if selected == 1 { "" } else { "s" }
+    ));
+    Ok(())
+}
+
+/// Stage a whole file (`git add`): the given path, or the current buffer's.
+fn stage_file(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    stage_file_impl(cx, args, false)
+}
+
+/// Unstage a whole file (`git reset HEAD -- <path>`).
+fn unstage_file(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    stage_file_impl(cx, args, true)
+}
+
+fn stage_file_impl(cx: &mut compositor::Context, args: Args, unstage: bool) -> anyhow::Result<()> {
+    let path = match args.first() {
+        Some(arg) => helix_stdx::path::canonicalize(helix_stdx::path::expand_tilde(
+            std::path::Path::new(arg),
+        )),
+        None => {
+            let (_, doc) = current_ref!(cx.editor);
+            doc.path()
+                .map(|p| p.to_path_buf())
+                .context("current buffer is not backed by a file")?
+        }
+    };
+
+    let workdir = helix_vcs::stage::repo_workdir(&path)?;
+    let rela = path.strip_prefix(&workdir)?.to_path_buf();
+    if unstage {
+        helix_vcs::stage::unstage_file(&workdir, &rela)?;
+    } else {
+        helix_vcs::stage::stage_file(&workdir, &rela)?;
+    }
+
+    let trust_full = git_trust(cx.editor, &path);
+    refresh_index_panes_from_git(cx.editor, &path, trust_full);
+    cx.editor.set_status(format!(
+        "{} {}",
+        if unstage { "Unstaged" } else { "Staged" },
+        rela.display()
+    ));
+    Ok(())
+}
+
 /// Build a read-only scratch document holding `bytes` (a VCS blob of `source`),
 /// with syntax highlighting detected from `source`'s file name and a display
 /// name like "default.nix (index)".
@@ -2783,15 +3031,7 @@ fn diff_git(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> any
     };
     let doc_orig = doc.id();
 
-    let workspace = path
-        .parent()
-        .map(|dir| helix_loader::find_workspace_in(dir).0)
-        .unwrap_or_else(|| helix_loader::find_workspace().0);
-    let trust_full = cx
-        .editor
-        .workspace_trust
-        .query(&workspace, helix_loader::workspace_trust::TrustQuery::Git)
-        .is_trusted();
+    let trust_full = git_trust(cx.editor, &path);
 
     use helix_vcs::FileRevision;
     // Left side: what the buffer is compared against. Right side: the working
@@ -2840,6 +3080,27 @@ fn diff_git(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> any
 
     let mut session = helix_view::diff_session::DiffSession::new(view_a, view_b, doc_a, doc_b);
     session.compute_hunks(&rope_a, &rope_b);
+    {
+        use helix_view::diff_session::{GitDiffContext, GitPane};
+        let left_pane = match left_rev {
+            FileRevision::Index => GitPane::Index,
+            FileRevision::Head => GitPane::Rev("HEAD".to_string()),
+            FileRevision::Rev(spec) => GitPane::Rev(spec.to_string()),
+        };
+        let right_pane = if staged {
+            GitPane::Index
+        } else {
+            GitPane::WorkingTree
+        };
+        if let Ok(workdir) = helix_vcs::stage::repo_workdir(&path) {
+            session.git = Some(GitDiffContext {
+                path: path.clone(),
+                workdir,
+                left: left_pane,
+                right: right_pane,
+            });
+        }
+    }
     cx.editor.diff_sessions.push(session);
 
     cx.editor.set_status(format!(
@@ -4356,6 +4617,50 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
                 doc: "diff the index against HEAD (staged changes)",
                 ..Flag::DEFAULT
             }],
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "stage-selection",
+        aliases: &["stage"],
+        doc: "Stage exactly the selected lines of the current file (the hunk under the cursor for a bare cursor).",
+        fun: stage_selection,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "unstage-selection",
+        aliases: &["unstage"],
+        doc: "Unstage the selected lines. Run from the index pane of a staged diff view (:diff-git --staged).",
+        fun: unstage_selection,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "stage-file",
+        aliases: &[],
+        doc: "Stage a whole file (git add): the given path, or the current buffer's file.",
+        fun: stage_file,
+        completer: CommandCompleter::positional(&[completers::filename]),
+        signature: Signature {
+            positionals: (0, Some(1)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "unstage-file",
+        aliases: &[],
+        doc: "Unstage a whole file (git reset HEAD): the given path, or the current buffer's file.",
+        fun: unstage_file,
+        completer: CommandCompleter::positional(&[completers::filename]),
+        signature: Signature {
+            positionals: (0, Some(1)),
             ..Signature::DEFAULT
         },
     },

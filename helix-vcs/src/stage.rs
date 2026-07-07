@@ -8,13 +8,47 @@
 //! there is no context matching to go wrong.
 
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context, Result};
-use helix_core::Rope;
+use helix_core::{Rope, RopeSlice};
 
 use crate::Hunk;
+
+struct RopeLines<'a>(RopeSlice<'a>);
+
+impl<'a> imara_diff::TokenSource for RopeLines<'a> {
+    type Token = RopeSlice<'a>;
+    type Tokenizer = helix_core::ropey::iter::Lines<'a>;
+
+    fn tokenize(&self) -> Self::Tokenizer {
+        self.0.lines()
+    }
+
+    fn estimate_tokens(&self) -> u32 {
+        self.0.len_lines() as u32
+    }
+}
+
+/// Line-level hunks between two ropes, using the same algorithm and
+/// tokenization as the editor's diff session (Histogram with the indent
+/// heuristic postprocess), so line indices agree with what a diff view shows.
+pub fn diff_hunks(before: &Rope, after: &Rope) -> Vec<Hunk> {
+    let input = imara_diff::InternedInput::new(
+        RopeLines(before.slice(..)),
+        RopeLines(after.slice(..)),
+    );
+    let mut diff = imara_diff::Diff::compute(imara_diff::Algorithm::Histogram, &input);
+    diff.postprocess_with(
+        &input.before,
+        &input.after,
+        imara_diff::IndentHeuristic::new(|token| {
+            imara_diff::IndentLevel::for_ascii_line(input.interner[token].bytes(), 4)
+        }),
+    );
+    diff.hunks().collect()
+}
 
 /// Inclusive, 0-indexed line ranges of a selection, as produced by
 /// `Selection::line_ranges`.
@@ -206,6 +240,18 @@ pub fn write_index_content(workdir: &Path, rela_path: &Path, content: &[u8]) -> 
         None,
     )?;
     Ok(())
+}
+
+/// The repository worktree root containing `path` (`git rev-parse
+/// --show-toplevel`).
+pub fn repo_workdir(path: &Path) -> Result<PathBuf> {
+    let dir = if path.is_dir() {
+        path
+    } else {
+        path.parent().context("path has no parent")?
+    };
+    let top = run_git(dir, &["rev-parse", "--show-toplevel"], None)?;
+    Ok(PathBuf::from(top))
 }
 
 /// Stage a whole file (`git add`). Works for modifications, new files, and
