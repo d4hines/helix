@@ -3042,13 +3042,25 @@ pub(crate) fn open_git_scratch(
     Ok(())
 }
 
-/// Open a git diff session for `path` in the focused view: worktree vs index
-/// (`staged == false`, right pane editable) or index vs HEAD (`staged ==
-/// true`, read-only). Replaces any diff session the focused view is in.
+/// What a path-based git diff session compares.
+#[derive(Debug, Clone)]
+pub(crate) enum GitDiffMode {
+    /// index ↔ working tree (right pane editable).
+    Unstaged,
+    /// HEAD ↔ index, both read-only.
+    Staged,
+    /// rev ↔ working tree (right pane editable).
+    RevVsWorktree(String),
+    /// rev ↔ rev, both read-only. Used for per-commit file diffs.
+    RevVsRev(String, String),
+}
+
+/// Open a git diff session for `path` in the focused view. Replaces any diff
+/// session the focused view is already in.
 pub(crate) fn open_git_diff_session(
     editor: &mut Editor,
     path: &std::path::Path,
-    staged: bool,
+    mode: GitDiffMode,
 ) -> anyhow::Result<()> {
     use helix_view::diff_session::{DiffSession, GitDiffContext, GitPane};
     use helix_vcs::FileRevision;
@@ -3059,39 +3071,58 @@ pub(crate) fn open_git_diff_session(
     }
 
     let trust_full = git_trust(editor, path);
-    let (left_rev, left_label) = if staged {
-        (FileRevision::Head, "HEAD")
-    } else {
-        (FileRevision::Index, "index")
+    let (left_rev, left_pane) = match &mode {
+        GitDiffMode::Unstaged => (FileRevision::Index, GitPane::Index),
+        GitDiffMode::Staged => (FileRevision::Head, GitPane::Rev("HEAD".to_string())),
+        GitDiffMode::RevVsWorktree(rev) | GitDiffMode::RevVsRev(rev, _) => {
+            (FileRevision::Rev(rev), GitPane::Rev(rev.clone()))
+        }
+    };
+    let left_label = match &left_pane {
+        GitPane::Index => "index".to_string(),
+        GitPane::Rev(rev) => rev.clone(),
+        GitPane::WorkingTree => unreachable!(),
     };
     let left_bytes = editor
         .diff_providers
         .get_file_at(path, left_rev, trust_full)
         .with_context(|| format!("unable to read '{left_label}' version of {}", path.display()))?;
-    let left_doc = git_scratch_document(editor, left_bytes, path, left_label)?;
+    let left_doc = git_scratch_document(editor, left_bytes, path, &left_label)?;
 
     // Resolve the right side before replacing the focused view.
-    let right_scratch = if staged {
-        let bytes = editor
-            .diff_providers
-            .get_file_at(path, FileRevision::Index, trust_full)
-            .with_context(|| format!("unable to read index version of {}", path.display()))?;
-        Some(git_scratch_document(editor, bytes, path, "index")?)
-    } else {
-        None
+    let right_scratch = match &mode {
+        GitDiffMode::Staged => {
+            let bytes = editor
+                .diff_providers
+                .get_file_at(path, FileRevision::Index, trust_full)
+                .with_context(|| format!("unable to read index version of {}", path.display()))?;
+            Some((git_scratch_document(editor, bytes, path, "index")?, GitPane::Index))
+        }
+        GitDiffMode::RevVsRev(_, rev) => {
+            let bytes = editor
+                .diff_providers
+                .get_file_at(path, FileRevision::Rev(rev), trust_full)
+                .with_context(|| {
+                    format!("unable to read '{rev}' version of {}", path.display())
+                })?;
+            Some((
+                git_scratch_document(editor, bytes, path, rev)?,
+                GitPane::Rev(rev.clone()),
+            ))
+        }
+        GitDiffMode::Unstaged | GitDiffMode::RevVsWorktree(_) => None,
     };
-    let worktree_doc = if staged {
-        None
-    } else {
-        Some(editor.open(path, Action::Replace)?)
+    let worktree_doc = match right_scratch {
+        Some(_) => None,
+        None => Some(editor.open(path, Action::Replace)?),
     };
 
     let doc_a = editor.new_file_from_document(Action::Replace, left_doc);
     let view_a = editor.tree.focus;
     let (doc_b, right_pane) = match (right_scratch, worktree_doc) {
-        (Some(doc), _) => (
+        (Some((doc, pane)), _) => (
             editor.new_file_from_document(Action::VerticalSplit, doc),
-            GitPane::Index,
+            pane,
         ),
         (None, Some(doc_id)) => {
             editor.switch(doc_id, Action::VerticalSplit);
@@ -3109,11 +3140,7 @@ pub(crate) fn open_git_diff_session(
         session.git = Some(GitDiffContext {
             path: path.to_path_buf(),
             workdir,
-            left: if staged {
-                GitPane::Rev("HEAD".to_string())
-            } else {
-                GitPane::Index
-            },
+            left: left_pane,
             right: right_pane,
         });
     }
@@ -3121,6 +3148,94 @@ pub(crate) fn open_git_diff_session(
     editor.tree.get_mut(view_a).diff_map = true;
     editor.tree.get_mut(view_b).diff_map = true;
     Ok(())
+}
+
+/// Compare a ref against the working tree: picker of changed files; Enter
+/// opens a ref↔worktree diff session for the file.
+fn git_compare(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    let Some(target) = args.first().map(str::to_owned) else {
+        bail!("usage: :git-compare <ref> (e.g. origin/master)");
+    };
+    let workdir = helix_vcs::stage::repo_workdir(&helix_stdx::env::current_working_dir())?;
+    let output = helix_vcs::stage::run_git(
+        &workdir,
+        &["diff", "--name-status", "-z", &target],
+        None,
+    )?;
+    if output.is_empty() {
+        cx.editor
+            .set_status(format!("no differences between {target} and the working tree"));
+        return Ok(());
+    }
+    let callback = async move {
+        let call: job::Callback = Callback::EditorCompositor(Box::new(
+            move |editor: &mut Editor, compositor: &mut Compositor| {
+                crate::commands::push_ref_compare_picker(editor, compositor, workdir, target, output);
+            },
+        ));
+        Ok(call)
+    };
+    cx.jobs.callback(callback);
+    Ok(())
+}
+
+fn git_stash(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    let workdir = helix_vcs::stage::repo_workdir(&helix_stdx::env::current_working_dir())?;
+    let message = args.first().map(str::to_owned);
+    let mut git_args = vec!["stash", "push"];
+    if let Some(msg) = &message {
+        git_args.push("-m");
+        git_args.push(msg);
+    }
+    helix_vcs::stage::run_git(&workdir, &git_args, None)?;
+    cx.editor.set_status("Stashed working tree changes");
+    Ok(())
+}
+
+fn git_stash_op(cx: &mut compositor::Context, args: Args, op: &str) -> anyhow::Result<()> {
+    let workdir = helix_vcs::stage::repo_workdir(&helix_stdx::env::current_working_dir())?;
+    let stash_ref = args
+        .first()
+        .map(str::to_owned)
+        .unwrap_or_else(|| "stash@{0}".to_string());
+    helix_vcs::stage::run_git(&workdir, &["stash", op, &stash_ref], None)?;
+    cx.editor.set_status(format!("stash {op}: {stash_ref}"));
+    Ok(())
+}
+
+fn git_stash_pop(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    git_stash_op(cx, args, "pop")
+}
+
+fn git_stash_apply(
+    cx: &mut compositor::Context,
+    args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    git_stash_op(cx, args, "apply")
+}
+
+fn git_stash_drop(
+    cx: &mut compositor::Context,
+    args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    git_stash_op(cx, args, "drop")
 }
 
 fn git_panel(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow::Result<()> {
@@ -4794,6 +4909,61 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
                 doc: "diff the index against HEAD (staged changes)",
                 ..Flag::DEFAULT
             }],
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "git-compare",
+        aliases: &[],
+        doc: "Compare a ref (e.g. origin/master) against the working tree: pick a changed file, open its diff.",
+        fun: git_compare,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (1, Some(1)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "git-stash",
+        aliases: &[],
+        doc: "Stash working tree changes (git stash push), with an optional message.",
+        fun: git_stash,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(1)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "git-stash-pop",
+        aliases: &[],
+        doc: "Pop a stash (default stash@{0}).",
+        fun: git_stash_pop,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(1)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "git-stash-apply",
+        aliases: &[],
+        doc: "Apply a stash without dropping it (default stash@{0}).",
+        fun: git_stash_apply,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(1)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "git-stash-drop",
+        aliases: &[],
+        doc: "Drop a stash (default stash@{0}).",
+        fun: git_stash_drop,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(1)),
             ..Signature::DEFAULT
         },
     },

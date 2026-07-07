@@ -40,17 +40,35 @@ pub fn get_file_at(file: &Path, rev: crate::FileRevision, trust_full: bool) -> R
     let file = if file.exists() {
         gix::path::realpath(file).context("resolve symlinks")?
     } else {
-        // Deleted files can't be canonicalized directly; resolve the parent.
-        let parent = file.parent().context("file has no parent directory")?;
-        let name = file.file_name().context("file has no name")?;
-        gix::path::realpath(parent)
-            .context("resolve symlinks")?
-            .join(name)
+        // Deleted files (possibly in deleted directories) can't be
+        // canonicalized directly: resolve the nearest existing ancestor and
+        // re-append the missing components.
+        let mut ancestor = file;
+        let mut missing: Vec<&std::ffi::OsStr> = Vec::new();
+        loop {
+            missing.push(ancestor.file_name().context("path has no file name")?);
+            ancestor = ancestor.parent().context("no existing ancestor")?;
+            if ancestor.exists() {
+                break;
+            }
+        }
+        let mut resolved = gix::path::realpath(ancestor).context("resolve symlinks")?;
+        for name in missing.iter().rev() {
+            resolved.push(name);
+        }
+        resolved
     };
 
     // TODO cache repository lookup
 
-    let repo_dir = get_repo_dir(&file)?;
+    // Discovery must start from a directory that exists; walk up past any
+    // deleted path components.
+    let mut repo_dir = get_repo_dir(&file)?;
+    while !repo_dir.exists() {
+        repo_dir = repo_dir
+            .parent()
+            .context("no existing ancestor for repo discovery")?;
+    }
     let repo = open_repo(repo_dir, trust_full)
         .context("failed to open git repo")?
         .to_thread_local();

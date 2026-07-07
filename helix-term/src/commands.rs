@@ -414,6 +414,9 @@ impl MappableCommand {
         lsp_or_syntax_symbol_picker, "Open symbol picker from LSP or syntax information",
         changed_file_picker, "Open changed file picker",
         git_panel_toggle, "Toggle git status panel",
+        git_log, "Open commit log picker",
+        git_file_history, "Open current file's commit history",
+        git_stash_picker, "Open stash picker",
         select_references_to_symbol_under_cursor, "Select symbol references",
         workspace_symbol_picker, "Open workspace symbol picker",
         syntax_workspace_symbol_picker, "Open workspace symbol picker from syntax information",
@@ -3585,6 +3588,435 @@ fn changed_file_picker(cx: &mut Context) {
                 true
             }
         });
+    cx.push_layer(Box::new(overlaid(picker)));
+}
+
+#[derive(Debug, Clone)]
+struct CommitItem {
+    sha: String,
+    short: String,
+    author: String,
+    age: String,
+    refs: String,
+    subject: String,
+}
+
+struct CommitPickerData {
+    style_sha: Style,
+    style_age: Style,
+    style_refs: Style,
+}
+
+/// One file touched by a commit (or a ref↔worktree comparison).
+#[derive(Debug, Clone)]
+struct CommitFileItem {
+    status: char,
+    /// Repo-relative path (rename target for renames).
+    rela: String,
+}
+
+fn parse_name_status(output: &str) -> Vec<CommitFileItem> {
+    let mut items = Vec::new();
+    let mut toks = output.split('\0').filter(|t| !t.is_empty());
+    while let Some(status_tok) = toks.next() {
+        let status = status_tok.chars().next().unwrap_or('?');
+        let Some(path) = toks.next() else { break };
+        // Renames/copies carry a second path (the target).
+        let rela = if matches!(status, 'R' | 'C') {
+            match toks.next() {
+                Some(target) => target,
+                None => path,
+            }
+        } else {
+            path
+        };
+        items.push(CommitFileItem {
+            status,
+            rela: rela.to_string(),
+        });
+    }
+    items
+}
+
+/// Open the right view for a file of `commit`: rev^ ↔ rev diff for
+/// modifications, the blob itself for additions/deletions.
+fn open_commit_file(editor: &mut Editor, workdir: &Path, item: &CommitFileItem, commit: &str) {
+    let abs = workdir.join(&item.rela);
+    let parent = format!("{commit}^");
+    let result = match item.status {
+        'A' => typed::open_git_scratch(editor, &abs, helix_vcs::FileRevision::Rev(commit)),
+        'D' => typed::open_git_scratch(editor, &abs, helix_vcs::FileRevision::Rev(&parent)),
+        _ => typed::open_git_diff_session(
+            editor,
+            &abs,
+            typed::GitDiffMode::RevVsRev(parent.clone(), commit.to_string()),
+        )
+        // Root commits have no parent: fall back to the blob at the commit.
+        .or_else(|_| typed::open_git_scratch(editor, &abs, helix_vcs::FileRevision::Rev(commit))),
+    };
+    if let Err(err) = result {
+        editor.set_error(err.to_string());
+    }
+}
+
+/// Picker over the files of `commit` (any committish, including stash refs);
+/// Enter opens the per-file diff against the commit's parent.
+fn push_commit_files_picker(
+    editor: &mut Editor,
+    compositor: &mut Compositor,
+    workdir: PathBuf,
+    commit: String,
+) {
+    let output = match helix_vcs::stage::run_git(
+        &workdir,
+        &["show", "--format=", "--name-status", "-z", &commit],
+        None,
+    ) {
+        Ok(out) => out,
+        Err(err) => {
+            editor.set_error(err.to_string());
+            return;
+        }
+    };
+    let files = parse_name_status(&output);
+    if files.is_empty() {
+        editor.set_error(format!("{commit}: no files changed"));
+        return;
+    }
+
+    let added = editor.theme.get("diff.plus");
+    let modified = editor.theme.get("diff.delta");
+    let deleted = editor.theme.get("diff.minus");
+
+    struct Data {
+        style_added: Style,
+        style_modified: Style,
+        style_deleted: Style,
+        workdir: PathBuf,
+        commit: String,
+    }
+    let columns = [
+        PickerColumn::new("status", |item: &CommitFileItem, data: &Data| {
+            let style = match item.status {
+                'A' => data.style_added,
+                'D' => data.style_deleted,
+                _ => data.style_modified,
+            };
+            Span::styled(item.status.to_string(), style).into()
+        }),
+        PickerColumn::new("path", |item: &CommitFileItem, _data: &Data| {
+            item.rela.clone().into()
+        }),
+    ];
+    let action_workdir = workdir.clone();
+    let action_commit = commit.clone();
+    let picker = Picker::new(
+        columns,
+        1,
+        files,
+        Data {
+            style_added: added,
+            style_modified: modified,
+            style_deleted: deleted,
+            workdir,
+            commit,
+        },
+        move |cx, item: &CommitFileItem, _action| {
+            open_commit_file(cx.editor, &action_workdir, item, &action_commit);
+        },
+    );
+    compositor.push(Box::new(overlaid(picker)));
+}
+
+/// Picker over files differing between `target` (a ref) and the working
+/// tree; Enter opens a ref↔worktree diff session per file. `output` is the
+/// pre-computed `git diff --name-status -z <target>` result.
+pub(crate) fn push_ref_compare_picker(
+    editor: &mut Editor,
+    compositor: &mut Compositor,
+    workdir: PathBuf,
+    target: String,
+    output: String,
+) {
+    let files = parse_name_status(&output);
+    if files.is_empty() {
+        editor.set_status(format!("no differences vs {target}"));
+        return;
+    }
+    struct Data {
+        style_added: Style,
+        style_modified: Style,
+        style_deleted: Style,
+    }
+    let columns = [
+        PickerColumn::new("status", |item: &CommitFileItem, data: &Data| {
+            let style = match item.status {
+                'A' => data.style_added,
+                'D' => data.style_deleted,
+                _ => data.style_modified,
+            };
+            Span::styled(item.status.to_string(), style).into()
+        }),
+        PickerColumn::new("path", |item: &CommitFileItem, _data: &Data| {
+            item.rela.clone().into()
+        }),
+    ];
+    let data = Data {
+        style_added: editor.theme.get("diff.plus"),
+        style_modified: editor.theme.get("diff.delta"),
+        style_deleted: editor.theme.get("diff.minus"),
+    };
+    let picker = Picker::new(
+        columns,
+        1,
+        files,
+        data,
+        move |cx, item: &CommitFileItem, _action| {
+            let abs = workdir.join(&item.rela);
+            let result = match item.status {
+                // Deleted in the worktree relative to the ref: show the ref's blob.
+                'D' => typed::open_git_scratch(
+                    cx.editor,
+                    &abs,
+                    helix_vcs::FileRevision::Rev(&target),
+                ),
+                // Added in the worktree: nothing on the ref side, plain open.
+                'A' => cx
+                    .editor
+                    .open(&abs, Action::Replace)
+                    .map(|_| ())
+                    .map_err(anyhow::Error::from),
+                _ => typed::open_git_diff_session(
+                    cx.editor,
+                    &abs,
+                    typed::GitDiffMode::RevVsWorktree(target.clone()),
+                ),
+            };
+            if let Err(err) = result {
+                cx.editor.set_error(err.to_string());
+            }
+        },
+    );
+    compositor.push(Box::new(overlaid(picker)));
+}
+
+/// Repo-wide commit log picker: fuzzy-searchable over sha, author, refs, and
+/// subject. Enter opens a picker of the commit's files; Enter there opens the
+/// per-file diff against the parent.
+fn git_log(cx: &mut Context) {
+    git_log_impl(cx, None);
+}
+
+/// Commit history of the current file (rename-tracking via --follow). Enter
+/// opens that commit's diff of this file directly.
+fn git_file_history(cx: &mut Context) {
+    let Some(path) = doc!(cx.editor).path().map(|p| p.to_path_buf()) else {
+        cx.editor
+            .set_error("current buffer is not backed by a file");
+        return;
+    };
+    git_log_impl(cx, Some(path));
+}
+
+fn git_log_impl(cx: &mut Context, path: Option<PathBuf>) {
+    let start = path
+        .clone()
+        .unwrap_or_else(helix_stdx::env::current_working_dir);
+    let workdir = match helix_vcs::stage::repo_workdir(&start) {
+        Ok(dir) => dir,
+        Err(err) => {
+            cx.editor.set_error(format!("not in a git repository: {err}"));
+            return;
+        }
+    };
+
+    let mut args: Vec<String> = vec![
+        "log".into(),
+        "--format=%H\u{1f}%h\u{1f}%an\u{1f}%cr\u{1f}%D\u{1f}%s".into(),
+        "-n".into(),
+        "5000".into(),
+    ];
+    let rela = path.as_ref().and_then(|p| {
+        p.strip_prefix(&workdir)
+            .ok()
+            .map(|r| r.to_string_lossy().into_owned())
+    });
+    if let Some(rela) = &rela {
+        args.push("--follow".into());
+        args.push("--".into());
+        args.push(rela.clone());
+    }
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let output = match helix_vcs::stage::run_git(&workdir, &arg_refs, None) {
+        Ok(out) => out,
+        Err(err) => {
+            cx.editor.set_error(err.to_string());
+            return;
+        }
+    };
+    let commits: Vec<CommitItem> = output
+        .lines()
+        .filter_map(|line| {
+            let mut f = line.split('\u{1f}');
+            Some(CommitItem {
+                sha: f.next()?.to_string(),
+                short: f.next()?.to_string(),
+                author: f.next()?.to_string(),
+                age: f.next()?.to_string(),
+                refs: f.next()?.to_string(),
+                subject: f.next()?.to_string(),
+            })
+        })
+        .collect();
+    if commits.is_empty() {
+        cx.editor.set_error("no commits found");
+        return;
+    }
+
+    let columns = [
+        PickerColumn::new("sha", |item: &CommitItem, data: &CommitPickerData| {
+            Span::styled(item.short.clone(), data.style_sha).into()
+        }),
+        PickerColumn::new("age", |item: &CommitItem, data: &CommitPickerData| {
+            Span::styled(item.age.clone(), data.style_age).into()
+        }),
+        PickerColumn::new("author", |item: &CommitItem, _data: &CommitPickerData| {
+            item.author.clone().into()
+        }),
+        PickerColumn::new("subject", |item: &CommitItem, data: &CommitPickerData| {
+            if item.refs.is_empty() {
+                item.subject.clone().into()
+            } else {
+                Spans::from(vec![
+                    Span::styled(format!("({}) ", item.refs), data.style_refs),
+                    Span::raw(item.subject.clone()),
+                ])
+                .into()
+            }
+        }),
+    ];
+    let data = CommitPickerData {
+        style_sha: cx.editor.theme.get("ui.text.inactive"),
+        style_age: cx.editor.theme.get("ui.text.inactive"),
+        style_refs: cx.editor.theme.get("diff.delta"),
+    };
+
+    let file_scope = rela;
+    let action_workdir = workdir.clone();
+    let picker = Picker::new(
+        columns,
+        3, // fuzzy over subject by default; sha/author/refs searchable via columns
+        commits,
+        data,
+        move |cx, item: &CommitItem, _action| {
+            let sha = item.sha.clone();
+            match &file_scope {
+                // File history: open this file's diff at that commit directly.
+                Some(rela) => {
+                    let item = CommitFileItem {
+                        status: 'M',
+                        rela: rela.clone(),
+                    };
+                    open_commit_file(cx.editor, &action_workdir, &item, &sha);
+                }
+                // Repo log: drill into the commit's file list.
+                None => {
+                    let workdir = action_workdir.clone();
+                    cx.jobs.callback(async move {
+                        let call: job::Callback = job::Callback::EditorCompositor(Box::new(
+                            move |editor: &mut Editor, compositor: &mut Compositor| {
+                                push_commit_files_picker(editor, compositor, workdir, sha);
+                            },
+                        ));
+                        Ok(call)
+                    });
+                }
+            }
+        },
+    );
+    cx.push_layer(Box::new(overlaid(picker)));
+}
+
+/// Stash picker: Enter drills into the stash's files (diff vs the stash
+/// base). Apply/pop/drop via :git-stash-* commands.
+fn git_stash_picker(cx: &mut Context) {
+    let workdir = match helix_vcs::stage::repo_workdir(&helix_stdx::env::current_working_dir()) {
+        Ok(dir) => dir,
+        Err(err) => {
+            cx.editor.set_error(format!("not in a git repository: {err}"));
+            return;
+        }
+    };
+    let output = match helix_vcs::stage::run_git(
+        &workdir,
+        &["stash", "list", "--format=%gd\u{1f}%cr\u{1f}%gs"],
+        None,
+    ) {
+        Ok(out) => out,
+        Err(err) => {
+            cx.editor.set_error(err.to_string());
+            return;
+        }
+    };
+    #[derive(Debug, Clone)]
+    struct StashItem {
+        refname: String,
+        age: String,
+        subject: String,
+    }
+    let stashes: Vec<StashItem> = output
+        .lines()
+        .filter_map(|line| {
+            let mut f = line.split('\u{1f}');
+            Some(StashItem {
+                refname: f.next()?.to_string(),
+                age: f.next()?.to_string(),
+                subject: f.next()?.to_string(),
+            })
+        })
+        .collect();
+    if stashes.is_empty() {
+        cx.editor.set_status("no stashes");
+        return;
+    }
+    struct StashData {
+        style_ref: Style,
+        style_age: Style,
+    }
+    let columns = [
+        PickerColumn::new("stash", |item: &StashItem, data: &StashData| {
+            Span::styled(item.refname.clone(), data.style_ref).into()
+        }),
+        PickerColumn::new("age", |item: &StashItem, data: &StashData| {
+            Span::styled(item.age.clone(), data.style_age).into()
+        }),
+        PickerColumn::new("subject", |item: &StashItem, _data: &StashData| {
+            item.subject.clone().into()
+        }),
+    ];
+    let data = StashData {
+        style_ref: cx.editor.theme.get("diff.delta"),
+        style_age: cx.editor.theme.get("ui.text.inactive"),
+    };
+    let action_workdir = workdir;
+    let picker = Picker::new(
+        columns,
+        2,
+        stashes,
+        data,
+        move |cx, item: &StashItem, _action| {
+            let refname = item.refname.clone();
+            let workdir = action_workdir.clone();
+            cx.jobs.callback(async move {
+                let call: job::Callback = job::Callback::EditorCompositor(Box::new(
+                    move |editor: &mut Editor, compositor: &mut Compositor| {
+                        push_commit_files_picker(editor, compositor, workdir, refname);
+                    },
+                ));
+                Ok(call)
+            });
+        },
+    );
     cx.push_layer(Box::new(overlaid(picker)));
 }
 

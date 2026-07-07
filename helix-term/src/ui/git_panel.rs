@@ -400,10 +400,16 @@ impl GitPanel {
             (Section::Staged, 'A') => {
                 commands::typed::open_git_scratch(editor, &abs, helix_vcs::FileRevision::Index)
             }
-            (Section::Unstaged, _) => {
-                commands::typed::open_git_diff_session(editor, &abs, false)
-            }
-            (Section::Staged, _) => commands::typed::open_git_diff_session(editor, &abs, true),
+            (Section::Unstaged, _) => commands::typed::open_git_diff_session(
+                editor,
+                &abs,
+                commands::typed::GitDiffMode::Unstaged,
+            ),
+            (Section::Staged, _) => commands::typed::open_git_diff_session(
+                editor,
+                &abs,
+                commands::typed::GitDiffMode::Staged,
+            ),
         };
         if let Err(err) = result {
             editor.set_error(err.to_string());
@@ -443,6 +449,32 @@ impl GitPanel {
                 }
             }
         }));
+    }
+
+    /// Async `git fetch` then refresh, so ahead/behind is trustworthy.
+    fn fetch(&self, cx: &mut commands::Context) {
+        let workdir = self.workdir.clone();
+        cx.editor.set_status("Fetching...");
+        cx.jobs.callback(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                helix_vcs::stage::run_git(&workdir, &["fetch", "--quiet"], None)
+            })
+            .await?;
+            let call: crate::job::Callback = crate::job::Callback::EditorCompositor(Box::new(
+                move |editor: &mut Editor, compositor: &mut compositor::Compositor| {
+                    match result {
+                        Ok(_) => editor.set_status("Fetched"),
+                        Err(err) => editor.set_error(err.to_string()),
+                    }
+                    if let Some(editor_view) = compositor.find::<ui::EditorView>() {
+                        if let Some(panel) = &mut editor_view.git_panel {
+                            panel.refresh();
+                        }
+                    }
+                },
+            ));
+            Ok(call)
+        });
     }
 
     fn push(&self, cx: &mut commands::Context) {
@@ -503,6 +535,7 @@ impl GitPanel {
             KeyCode::Char('d') => self.request_discard(),
             KeyCode::Char('c') => self.commit_prompt(cx),
             KeyCode::Char('P') => self.push(cx),
+            KeyCode::Char('F') => self.fetch(cx),
             KeyCode::Char('R') => self.refresh(),
             KeyCode::Enter => {
                 if let Some(i) = self.file_at(self.cursor) {

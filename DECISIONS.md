@@ -105,3 +105,22 @@ for the full spec.
   filesystem watcher yet — external git changes need R.
 - Commit refreshes the panel via a compositor callback that fires when the
   prompt closes.
+
+## P4: commits & history
+
+- **`git_log`** (repo log picker: fuzzy over sha/author/refs/subject — doubles
+  as commit search), **`git_file_history`** (current file, `--follow` rename
+  tracking; Enter opens that commit's diff of the file directly),
+  **`git_stash_picker`**, plus typed `:git-compare <ref>`, `:git-stash[-pop/
+  -apply/-drop]`. Commit → files picker → per-file rev^↔rev diff session;
+  added/deleted files open the blob instead. Stashes drill in exactly like
+  commits (a stash is a commit).
+- **Panel `F` = async git fetch** then refresh (ahead/behind trustworthy).
+  Background auto-fetch on a timer deferred: needs config plumbing; the
+  panel-open + F flow covers the "do I need to rebase" signal for now.
+- **Known quirk**: invoking git_log from the command palette closes the
+  spawned picker immediately (palette pop-ordering); direct keybindings work.
+  Needs a look before upstreaming.
+- **Fixed**: blob lookups for files in deleted directories (walk to nearest
+  existing ancestor for both realpath and repo discovery).
+- No default keybindings yet — same rationale as staging commands.
