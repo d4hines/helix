@@ -44,6 +44,8 @@ pub struct EditorView {
     spinners: ProgressSpinners,
     /// Tracks if the terminal window is focused by reaction to terminal focus events
     terminal_focused: bool,
+    /// Docked git status panel (None when closed).
+    pub git_panel: Option<crate::ui::git_panel::GitPanel>,
 }
 
 #[derive(Debug, Clone)]
@@ -67,11 +69,31 @@ impl EditorView {
             completion: None,
             spinners: ProgressSpinners::default(),
             terminal_focused: true,
+            git_panel: None,
         }
     }
 
     pub fn spinners_mut(&mut self) -> &mut ProgressSpinners {
         &mut self.spinners
+    }
+
+    /// Toggle the docked git status panel. Opening focuses it; the repository
+    /// is discovered from the focused document's path (falling back to the
+    /// process working directory).
+    pub fn toggle_git_panel(&mut self, editor: &mut Editor) {
+        if self.git_panel.take().is_some() {
+            return;
+        }
+        let start = doc!(editor)
+            .path()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| helix_stdx::env::current_working_dir());
+        match helix_vcs::stage::repo_workdir(&start) {
+            Ok(workdir) => {
+                self.git_panel = Some(crate::ui::git_panel::GitPanel::new(workdir));
+            }
+            Err(err) => editor.set_error(format!("not in a git repository: {err}")),
+        }
     }
 
     pub fn render_view(
@@ -1483,6 +1505,14 @@ impl EditorView {
             self.handle_non_key_input(cxt)
         }
 
+        // Give the git panel first refusal on mouse events (it tracks its own
+        // screen area and consumes events inside it).
+        if let Some(panel) = &mut self.git_panel {
+            if event.kind != MouseEventKind::Moved && panel.handle_mouse(event, cxt) {
+                return EventResult::Consumed(None);
+            }
+        }
+
         let config = cxt.editor.config();
         let MouseEvent {
             kind,
@@ -1768,6 +1798,26 @@ impl Component for EditorView {
                 // clear status
                 cx.editor.status_msg = None;
 
+                // A focused git panel captures keys before modal dispatch.
+                if self.git_panel.as_ref().is_some_and(|p| p.focused) {
+                    if let Some(panel) = &mut self.git_panel {
+                        panel.handle_key(key, &mut cx);
+                        if panel.close_requested {
+                            self.git_panel = None;
+                        }
+                    }
+                    let callbacks = take(&mut cx.callback);
+                    return EventResult::Consumed(if callbacks.is_empty() {
+                        None
+                    } else {
+                        Some(Box::new(move |compositor, cx| {
+                            for callback in callbacks {
+                                callback(compositor, cx)
+                            }
+                        }))
+                    });
+                }
+
                 let mode = cx.editor.mode();
 
                 if !self.on_next_key(OnKeyCallbackKind::PseudoPending, &mut cx, key) {
@@ -1909,6 +1959,14 @@ impl Component for EditorView {
             editor_area = editor_area.clip_top(1);
         }
 
+        // Reserve the left edge for the docked git panel.
+        let panel_area = self.git_panel.as_ref().map(|_| {
+            let width = crate::ui::git_panel::PANEL_WIDTH.min(editor_area.width / 2);
+            let panel_area = editor_area.with_width(width);
+            editor_area = editor_area.clip_left(width);
+            panel_area
+        });
+
         // if the terminal size suddenly changed, we need to trigger a resize
         cx.editor.resize(editor_area);
 
@@ -1933,6 +1991,10 @@ impl Component for EditorView {
         for (view, is_focused) in cx.editor.tree.views() {
             let doc = cx.editor.document(view.doc).unwrap();
             self.render_view(cx.editor, doc, view, area, surface, is_focused);
+        }
+
+        if let (Some(panel), Some(panel_area)) = (&mut self.git_panel, panel_area) {
+            panel.render(panel_area, surface, cx.editor);
         }
 
         if config.auto_info {

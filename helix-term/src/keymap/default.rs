@@ -338,6 +338,8 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
 
         "C-a" => increment,
         "C-x" => decrement,
+
+        "C-S-d" => git_panel_toggle,
     });
     let mut select = normal.clone();
     select.merge_nodes(keymap!({ "Select mode"

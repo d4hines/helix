@@ -79,3 +79,29 @@ for the full spec.
   stay consistent. Flag lifecycle: set on session creation, cleared by
   `Editor::remove_diff_sessions` (used by :diff-off and view/doc close paths).
 - Not yet clickable (click-to-jump is a later nicety).
+
+## P3: docked git status panel
+
+- **`:git-panel` / `git_panel_toggle` (default `C-S-d`)** opens a built-in,
+  non-moveable 36-col panel on the left edge (VS Code SCM view shape). The
+  editor tree resizes around it; it is not a window-tree split and cannot be
+  rearranged. NOTE: C-S-d only reaches helix in bare Kitty until tmux
+  extended-keys is enabled; :git-panel works everywhere.
+- **Content**: branch header (⎇ name, ↑ahead ↓behind when upstream exists),
+  STAGED CHANGES (n) and CHANGES (n) sections. Untracked = U, conflicts = C
+  (both in CHANGES). Renames consume the origin path (letter R).
+- **Keys**: j/k/g/G move, space marks for batch, s stage, u unstage,
+  a stage-all, d discard (second d confirms; untracked files are *deleted*),
+  c commit (one-line prompt for now; COMMIT_EDITMSG buffer later), P push
+  (async job), R refresh, Enter opens the right view per entry (M→diff
+  session, U→plain open, D→last content, staged M→staged diff), Esc unfocus,
+  q close.
+- **Mouse**: click glyph cells `[+/−]`=stage/unstage, `[✗]`=discard
+  (confirmed), filename=open diff (VS Code behavior), scroll wheel scrolls.
+  Click zones share the keyboard action code; verified by review + keyboard
+  path, needs a hand test on real mouse input.
+- **Discard reloads open buffers** for restored files (mirrors :reload).
+- **Refresh model is manual/action-driven** (open, R, after actions). No
+  filesystem watcher yet — external git changes need R.
+- Commit refreshes the panel via a compositor callback that fires when the
+  prompt closes.

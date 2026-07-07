@@ -2738,7 +2738,7 @@ fn diff_open(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> an
 
 /// Whether git operations may trust repository-local config for `path`'s
 /// workspace (filters etc.), per the workspace-trust store.
-fn git_trust(editor: &Editor, path: &std::path::Path) -> bool {
+pub(crate) fn git_trust(editor: &Editor, path: &std::path::Path) -> bool {
     let workspace = path
         .parent()
         .map(|dir| helix_loader::find_workspace_in(dir).0)
@@ -2787,7 +2787,11 @@ fn refresh_index_panes(editor: &mut Editor, path: &std::path::Path, new_index: &
 /// Re-read the index version of `path` from git and refresh any panes
 /// displaying it. Used after whole-file staging operations where the new
 /// index content isn't already in memory.
-fn refresh_index_panes_from_git(editor: &mut Editor, path: &std::path::Path, trust_full: bool) {
+pub(crate) fn refresh_index_panes_from_git(
+    editor: &mut Editor,
+    path: &std::path::Path,
+    trust_full: bool,
+) {
     if let Some(bytes) =
         editor
             .diff_providers
@@ -3013,6 +3017,128 @@ fn git_scratch_document(
         .unwrap_or_default();
     doc.display_name_override = Some(format!("{file_name} ({label})"));
     Ok(doc)
+}
+
+/// Open a read-only scratch buffer showing `path` at `rev` in the focused
+/// view. Used by the status panel for deleted/added entries.
+pub(crate) fn open_git_scratch(
+    editor: &mut Editor,
+    path: &std::path::Path,
+    rev: helix_vcs::FileRevision,
+) -> anyhow::Result<()> {
+    let trust_full = git_trust(editor, path);
+    let label = match rev {
+        helix_vcs::FileRevision::Index => "index",
+        helix_vcs::FileRevision::Head => "HEAD",
+        helix_vcs::FileRevision::Rev(spec) => spec,
+    }
+    .to_string();
+    let bytes = editor
+        .diff_providers
+        .get_file_at(path, rev, trust_full)
+        .with_context(|| format!("unable to read '{label}' version of {}", path.display()))?;
+    let doc = git_scratch_document(editor, bytes, path, &label)?;
+    editor.new_file_from_document(Action::Replace, doc);
+    Ok(())
+}
+
+/// Open a git diff session for `path` in the focused view: worktree vs index
+/// (`staged == false`, right pane editable) or index vs HEAD (`staged ==
+/// true`, read-only). Replaces any diff session the focused view is in.
+pub(crate) fn open_git_diff_session(
+    editor: &mut Editor,
+    path: &std::path::Path,
+    staged: bool,
+) -> anyhow::Result<()> {
+    use helix_view::diff_session::{DiffSession, GitDiffContext, GitPane};
+    use helix_vcs::FileRevision;
+
+    let focus = editor.tree.focus;
+    if editor.diff_session_for(focus).is_some() {
+        editor.remove_diff_sessions(|s| s.contains_view(focus));
+    }
+
+    let trust_full = git_trust(editor, path);
+    let (left_rev, left_label) = if staged {
+        (FileRevision::Head, "HEAD")
+    } else {
+        (FileRevision::Index, "index")
+    };
+    let left_bytes = editor
+        .diff_providers
+        .get_file_at(path, left_rev, trust_full)
+        .with_context(|| format!("unable to read '{left_label}' version of {}", path.display()))?;
+    let left_doc = git_scratch_document(editor, left_bytes, path, left_label)?;
+
+    // Resolve the right side before replacing the focused view.
+    let right_scratch = if staged {
+        let bytes = editor
+            .diff_providers
+            .get_file_at(path, FileRevision::Index, trust_full)
+            .with_context(|| format!("unable to read index version of {}", path.display()))?;
+        Some(git_scratch_document(editor, bytes, path, "index")?)
+    } else {
+        None
+    };
+    let worktree_doc = if staged {
+        None
+    } else {
+        Some(editor.open(path, Action::Replace)?)
+    };
+
+    let doc_a = editor.new_file_from_document(Action::Replace, left_doc);
+    let view_a = editor.tree.focus;
+    let (doc_b, right_pane) = match (right_scratch, worktree_doc) {
+        (Some(doc), _) => (
+            editor.new_file_from_document(Action::VerticalSplit, doc),
+            GitPane::Index,
+        ),
+        (None, Some(doc_id)) => {
+            editor.switch(doc_id, Action::VerticalSplit);
+            (doc_id, GitPane::WorkingTree)
+        }
+        (None, None) => unreachable!(),
+    };
+    let view_b = editor.tree.focus;
+
+    let rope_a = editor.documents[&doc_a].text().clone();
+    let rope_b = editor.documents[&doc_b].text().clone();
+    let mut session = DiffSession::new(view_a, view_b, doc_a, doc_b);
+    session.compute_hunks(&rope_a, &rope_b);
+    if let Ok(workdir) = helix_vcs::stage::repo_workdir(path) {
+        session.git = Some(GitDiffContext {
+            path: path.to_path_buf(),
+            workdir,
+            left: if staged {
+                GitPane::Rev("HEAD".to_string())
+            } else {
+                GitPane::Index
+            },
+            right: right_pane,
+        });
+    }
+    editor.diff_sessions.push(session);
+    editor.tree.get_mut(view_a).diff_map = true;
+    editor.tree.get_mut(view_b).diff_map = true;
+    Ok(())
+}
+
+fn git_panel(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    let callback = async move {
+        let call: job::Callback = Callback::EditorCompositor(Box::new(
+            move |editor: &mut Editor, compositor: &mut Compositor| {
+                if let Some(editor_view) = compositor.find::<crate::ui::EditorView>() {
+                    editor_view.toggle_git_panel(editor);
+                }
+            },
+        ));
+        Ok(call)
+    };
+    cx.jobs.callback(callback);
+    Ok(())
 }
 
 /// Open a read-only scratch buffer with the contents of a file as stored at a
@@ -4668,6 +4794,17 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
                 doc: "diff the index against HEAD (staged changes)",
                 ..Flag::DEFAULT
             }],
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "git-panel",
+        aliases: &[],
+        doc: "Toggle the docked git status panel (stage/unstage/discard files, commit, push).",
+        fun: git_panel,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
             ..Signature::DEFAULT
         },
     },

@@ -1,6 +1,7 @@
 mod completion;
 mod document;
 pub(crate) mod editor;
+pub mod git_panel;
 mod info;
 pub mod lsp;
 mod markdown;
@@ -20,6 +21,7 @@ use crate::filter_picker_entry;
 use crate::job::{self, Callback};
 pub use completion::Completion;
 pub use editor::EditorView;
+pub use git_panel::GitPanel;
 use helix_stdx::rope;
 use helix_view::theme::Style;
 pub use markdown::Markdown;

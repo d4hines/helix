@@ -413,6 +413,7 @@ impl MappableCommand {
         syntax_symbol_picker, "Open symbol picker from syntax information",
         lsp_or_syntax_symbol_picker, "Open symbol picker from LSP or syntax information",
         changed_file_picker, "Open changed file picker",
+        git_panel_toggle, "Toggle git status panel",
         select_references_to_symbol_under_cursor, "Select symbol references",
         workspace_symbol_picker, "Open workspace symbol picker",
         syntax_workspace_symbol_picker, "Open workspace symbol picker from syntax information",
@@ -3585,6 +3586,16 @@ fn changed_file_picker(cx: &mut Context) {
             }
         });
     cx.push_layer(Box::new(overlaid(picker)));
+}
+
+fn git_panel_toggle(cx: &mut Context) {
+    cx.callback.push(Box::new(
+        |compositor: &mut Compositor, cx: &mut compositor::Context| {
+            if let Some(editor_view) = compositor.find::<ui::EditorView>() {
+                editor_view.toggle_git_panel(cx.editor);
+            }
+        },
+    ));
 }
 
 pub fn command_palette(cx: &mut Context) {
