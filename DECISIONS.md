@@ -124,3 +124,25 @@ for the full spec.
 - **Fixed**: blob lookups for files in deleted directories (walk to nearest
   existing ancestor for both realpath and repo discovery).
 - No default keybindings yet — same rationale as staging commands.
+
+## Visual design pass (Daniel's picks from the design lab artifact)
+
+- **A1**: VS Code diff semantics — everything on the left/before side renders
+  as a removal (red), everything on the right/after side as an addition
+  (green); word-level emphasis at a brighter blend. New theme scopes
+  `diff.{plus,minus}.view.text` (+ palette entries in all catppuccin
+  variants, line 20% / word 45% blends). The old vimdiff delta-blue behavior
+  remains reachable via the delta fallback chain for themes that define it.
+- **B1**: alignment fillers render the ╱ hatch (new `diff.filler.view` scope,
+  surface2 @55% blend; `ui.virtual` fallback) via a Decoration that draws
+  into the rows the DiffAlignment annotation reserves.
+- **C1**: single two-column overview ruler at the far right of the diff pair
+  (right pane only): red column = removals, green = additions, proportional
+  visible-range thumb (ui.selection bg). Left pane reserves nothing.
+- **D1+E1**: quiet panel — nerd-font devicons per file (graceful plain-glyph
+  fallback), no permanent action glyphs, status letters are the mouse target
+  for stage/unstage (rest of the row opens the entry), VS Code letter colors
+  (M amber via `warning`, A/U green, D/C red), dim uppercase section labels
+  with quiet counts,  branch header with ahead/behind + fetch freshness and
+  a hairline rule. Diff-coloring unit tests updated to pin the new semantics.
+- Pane titles shorten full 40-char shas to 7.

@@ -70,6 +70,9 @@
 "diff.minus.view" = { bg = "diff_minus_view" }
 "diff.delta.view" = { bg = "diff_delta_view" }
 "diff.delta.view.text" = { bg = "diff_delta_view_text" }
+"diff.plus.view.text" = { bg = "diff_plus_view_text" }
+"diff.minus.view.text" = { bg = "diff_minus_view_text" }
+"diff.filler.view" = { fg = "diff_filler_view" }
 
 # User Interface
 # --------------
@@ -177,3 +180,6 @@ diff_plus_view = "#394545"
 diff_minus_view = "#493446"
 diff_delta_view = "#333c57"
 diff_delta_view_text = "#495a80"
+diff_plus_view_text = "#5b7762"
+diff_minus_view_text = "#7e4f65"
+diff_filler_view = "#3e4052"

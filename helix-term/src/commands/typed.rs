@@ -2725,7 +2725,7 @@ fn diff_open(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> an
     session.compute_hunks(&rope_a, &rope_b);
 
     cx.editor.diff_sessions.push(session);
-    cx.editor.tree.get_mut(view_a).diff_map = true;
+    // Overview ruler lives on the right pane only.
     cx.editor.tree.get_mut(view_b).diff_map = true;
     cx.editor.set_status(format!(
         "Diff: {} vs {}",
@@ -3015,6 +3015,12 @@ fn git_scratch_document(
         .file_name()
         .map(|n| n.to_string_lossy())
         .unwrap_or_default();
+    // Full commit hashes are noise in a pane title; show the short form.
+    let label = if label.len() == 40 && label.bytes().all(|b| b.is_ascii_hexdigit()) {
+        &label[..7]
+    } else {
+        label
+    };
     doc.display_name_override = Some(format!("{file_name} ({label})"));
     Ok(doc)
 }
@@ -3145,7 +3151,7 @@ pub(crate) fn open_git_diff_session(
         });
     }
     editor.diff_sessions.push(session);
-    editor.tree.get_mut(view_a).diff_map = true;
+    // Overview ruler lives on the right pane only.
     editor.tree.get_mut(view_b).diff_map = true;
     Ok(())
 }
@@ -3396,7 +3402,7 @@ fn diff_git(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> any
         }
     }
     cx.editor.diff_sessions.push(session);
-    cx.editor.tree.get_mut(view_a).diff_map = true;
+    // Overview ruler lives on the right pane only.
     cx.editor.tree.get_mut(view_b).diff_map = true;
 
     cx.editor.set_status(format!(
@@ -3638,7 +3644,7 @@ fn diff_this(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> a
             );
             session.compute_hunks(&rope_a, &rope_b);
             cx.editor.diff_sessions.push(session);
-            cx.editor.tree.get_mut(other_view_id).diff_map = true;
+            // Overview ruler lives on the right pane only.
             cx.editor.tree.get_mut(view_id).diff_map = true;
             cx.editor.set_status("Diff session started.");
         }

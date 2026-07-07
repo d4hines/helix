@@ -125,6 +125,8 @@ impl EditorView {
         });
 
         let mut text_annotations = view.text_annotations(doc, Some(theme));
+        // Filler counts, kept for the `╱` pattern decoration added below.
+        let mut diff_fillers: Option<Arc<Vec<u32>>> = None;
 
         // Add DiffAlignment line annotation last so it can account for other virtual text.
         if let Some((side, partner_view_id, ref hunks, _, (doc_a_id, doc_b_id))) = diff_view_info {
@@ -165,13 +167,15 @@ impl EditorView {
                     })
                     .collect()
             });
+            let fillers = Arc::new(fillers);
             text_annotations.add_line_annotation(Box::new(
                 helix_view::diff_session::DiffAlignment::new(
                     Arc::clone(hunks),
                     side,
-                    Arc::new(fillers),
+                    Arc::clone(&fillers),
                 ),
             ));
+            diff_fillers = Some(fillers);
         }
 
         let mut decorations = DecorationManager::default();
@@ -344,8 +348,22 @@ impl EditorView {
         // from the bare `diff.delta` scope, which is shared with the diff language
         // grammar and the VCS gutter.
         if let Some((side, _, _, ref intra_line_cache, (doc_a_id, doc_b_id))) = diff_view_info {
+            // Side-based emphasis: brighter red on the left, brighter green
+            // on the right (VS Code). Falls back through the delta chain for
+            // themes that only define the older scopes.
+            let (text_scope, view_scope, bare_scope) = match side {
+                helix_view::diff_session::DiffSide::A => {
+                    ("diff.minus.view.text", "diff.minus.view", "diff.minus")
+                }
+                helix_view::diff_session::DiffSide::B => {
+                    ("diff.plus.view.text", "diff.plus.view", "diff.plus")
+                }
+            };
             let intra_highlight = theme
-                .find_highlight_exact("diff.delta.view.text")
+                .find_highlight_exact(text_scope)
+                .or_else(|| theme.find_highlight_exact(view_scope))
+                .or_else(|| theme.find_highlight_exact(bare_scope))
+                .or_else(|| theme.find_highlight_exact("diff.delta.view.text"))
                 .or_else(|| theme.find_highlight_exact("diff.delta.view"))
                 .or_else(|| theme.find_highlight_exact("diff.delta"));
             if let Some(highlight) = intra_highlight {
@@ -436,6 +454,19 @@ impl EditorView {
             inline_diagnostic_config,
             config.end_of_line_diagnostics,
         ));
+        // Diff filler pattern renders after inline diagnostics so its rows
+        // land in the space DiffAlignment reserved below them.
+        if let (Some(fillers), Some((side, _, ref hunks, _, _))) = (diff_fillers, &diff_view_info) {
+            let style = theme
+                .try_get("diff.filler.view")
+                .unwrap_or_else(|| theme.get("ui.virtual"));
+            decorations.add_decoration(DiffFillerLines::new(
+                Arc::clone(hunks),
+                *side,
+                fillers,
+                style,
+            ));
+        }
         render_document(
             surface,
             inner,
@@ -481,11 +512,11 @@ impl EditorView {
         statusline::render(&mut context, statusline_area, surface);
     }
 
-    /// Render the diff-map column: a 1-cell overview strip in the view's
-    /// reserved rightmost column showing hunk positions scaled across the
-    /// whole file (VS Code's overview ruler), plus a scroll thumb for the
-    /// visible range. The column is reserved by `View::inner_area` while the
-    /// view is part of a diff session.
+    /// Render the overview ruler: two reserved columns at the right edge of
+    /// the diff pair (right pane only). Left column carries removal marks
+    /// (red), right column addition marks (green), both scaled across the
+    /// file; the visible range gets a subtle raised-thumb background so the
+    /// ruler doubles as a proportional scrollbar — VS Code's overview ruler.
     fn render_diff_map(
         doc: &Document,
         view: &View,
@@ -495,50 +526,66 @@ impl EditorView {
         theme: &Theme,
     ) {
         use helix_view::diff_session::DiffSide;
+        // The ruler lives on the right pane; the left pane reserves nothing.
+        if side != DiffSide::B {
+            return;
+        }
         let inner = view.inner_area(doc);
         if inner.height == 0 || !view.diff_map {
             return;
         }
-        let x = inner.x + inner.width;
+        let (x_removed, x_added) = (inner.x + inner.width, inner.x + inner.width + 1);
         let height = inner.height as usize;
         let text = doc.text().slice(..);
         let total = text.len_lines().max(1);
         let row_of = |line: usize| -> u16 { ((line * height / total).min(height - 1)) as u16 };
 
-        // Scroll thumb: rows covering the visible doc-line range.
+        // Thumb: a raised background over the rows corresponding to the
+        // visible range, in both columns.
         let anchor = doc.view_offset(view.id).anchor.min(text.len_chars());
         let first = text.char_to_line(anchor);
         let last = view.estimate_last_doc_line(doc);
-        let thumb_style = theme.get("ui.menu.scroll");
+        let thumb_bg = theme
+            .try_get("ui.selection")
+            .and_then(|s| s.bg)
+            .unwrap_or(helix_view::graphics::Color::Rgb(81, 87, 109));
         for row in row_of(first)..=row_of(last) {
-            surface.set_string(x, inner.y + row, "▏", thumb_style);
+            for x in [x_removed, x_added] {
+                surface[(x, inner.y + row)].set_symbol(" ").set_bg(thumb_bg);
+            }
         }
 
-        // Hunk marks, colored by change kind with the diff gutter palette.
-        let plus = theme.get("diff.plus");
-        let minus = theme.get("diff.minus");
-        let delta = theme.get("diff.delta");
+        // Marks, positioned in the right pane's line space: removals anchor
+        // where the deleted content sits (or its gap), additions cover the
+        // added/changed rows. Drawn with fg only so the thumb shows through.
+        let plus_fg = theme
+            .get("diff.plus")
+            .fg
+            .unwrap_or(helix_view::graphics::Color::Green);
+        let minus_fg = theme
+            .get("diff.minus")
+            .fg
+            .unwrap_or(helix_view::graphics::Color::Red);
         for hunk in hunks {
-            let my_range = match side {
-                DiffSide::A => &hunk.before,
-                DiffSide::B => &hunk.after,
-            };
-            let style = if hunk.before.is_empty() {
-                plus
-            } else if hunk.after.is_empty() {
-                minus
-            } else {
-                delta
-            };
-            let (start, end) = if my_range.is_empty() {
-                // Pure deletion on this side: mark the line below the gap,
-                // where the gutter renders its deletion indicator.
-                (my_range.start as usize, my_range.start as usize)
-            } else {
-                (my_range.start as usize, my_range.end as usize - 1)
-            };
-            for row in row_of(start)..=row_of(end) {
-                surface.set_string(x, inner.y + row, "▐", style);
+            if !hunk.before.is_empty() {
+                let (start, end) = if hunk.after.is_empty() {
+                    (hunk.after.start as usize, hunk.after.start as usize)
+                } else {
+                    (hunk.after.start as usize, hunk.after.end as usize - 1)
+                };
+                for row in row_of(start)..=row_of(end) {
+                    surface[(x_removed, inner.y + row)]
+                        .set_symbol("▌")
+                        .set_fg(minus_fg);
+                }
+            }
+            if !hunk.after.is_empty() {
+                for row in row_of(hunk.after.start as usize)..=row_of(hunk.after.end as usize - 1)
+                {
+                    surface[(x_added, inner.y + row)]
+                        .set_symbol("▐")
+                        .set_fg(plus_fg);
+                }
             }
         }
     }
@@ -2120,6 +2167,58 @@ fn canonicalize_key(key: &mut KeyEvent) {
 /// Uses `try_get_exact` (no rsplit cascade) on both lookups to keep the
 /// fallback bounded: it must not leak further to bare `diff`, which the `diff`
 /// language grammar and the VCS gutter already use for unrelated meanings.
+/// Draws the diagonal `╱` pattern into the virtual filler lines that a diff
+/// session's `DiffAlignment` annotation reserves, so alignment gaps read as
+/// texture instead of blank holes (the VS Code / diffview.nvim hatch).
+///
+/// Wraps a second `DiffAlignment` purely as the per-line filler counter; the
+/// actual row reservation is done by the annotation added to the view's
+/// `TextAnnotations`.
+struct DiffFillerLines {
+    counter: helix_view::diff_session::DiffAlignment,
+    style: Style,
+}
+
+impl DiffFillerLines {
+    fn new(
+        hunks: Arc<Vec<helix_vcs::Hunk>>,
+        side: helix_view::diff_session::DiffSide,
+        fillers: Arc<Vec<u32>>,
+        style: Style,
+    ) -> Self {
+        Self {
+            counter: helix_view::diff_session::DiffAlignment::new(hunks, side, fillers),
+            style,
+        }
+    }
+}
+
+impl Decoration for DiffFillerLines {
+    fn render_virt_lines(
+        &mut self,
+        renderer: &mut TextRenderer,
+        pos: LinePos,
+        virt_off: helix_core::Position,
+    ) -> helix_core::Position {
+        let count = self.counter.filler_lines_at(pos.doc_line);
+        if count == 0 {
+            return helix_core::Position::new(0, 0);
+        }
+        let width = renderer.viewport.width as usize;
+        let pattern = "╱".repeat(width);
+        let mut drawn = 0usize;
+        for i in 0..count {
+            let row = pos.visual_line as usize + virt_off.row + i;
+            if row >= renderer.viewport.height as usize {
+                break;
+            }
+            renderer.set_string(renderer.viewport.x, row as u16, &pattern, self.style);
+            drawn += 1;
+        }
+        helix_core::Position::new(drawn, 0)
+    }
+}
+
 fn diff_view_line_style(theme: &helix_view::Theme, base: &str) -> Option<Style> {
     theme
         .try_get_exact(&format!("{base}.view"))
@@ -2190,13 +2289,12 @@ fn diff_line_char_ranges(
         let end = rope.line_to_char(my_range.end as usize);
         let line_range = start..end;
 
-        if other_range.is_empty() {
-            match side {
-                DiffSide::A => minus.push(line_range),
-                DiffSide::B => plus.push(line_range),
-            }
-        } else {
-            delta.push(line_range);
+        // VS Code semantics: the whole before-side of a hunk is a removal,
+        // the whole after-side an addition, regardless of the partner range.
+        let _ = other_range;
+        match side {
+            DiffSide::A => minus.push(line_range),
+            DiffSide::B => plus.push(line_range),
         }
     }
 
@@ -2205,20 +2303,20 @@ fn diff_line_char_ranges(
 
 /// Selects the diff line background style based on which side is being rendered
 /// and whether the opposite side has any content for this hunk.
+/// VS Code semantics: everything a hunk touches on the left/before side is a
+/// removal (red); everything on the right/after side is an addition (green).
+/// `style_modified` is kept in the signature for themes/configs that may want
+/// the old vimdiff behavior later, but is currently unused.
 fn diff_line_style(
     side: helix_view::diff_session::DiffSide,
-    other_range_empty: bool,
+    _other_range_empty: bool,
     style_deleted: Style,
     style_added: Style,
-    style_modified: Style,
+    _style_modified: Style,
 ) -> Style {
-    if other_range_empty {
-        match side {
-            helix_view::diff_session::DiffSide::A => style_deleted,
-            helix_view::diff_session::DiffSide::B => style_added,
-        }
-    } else {
-        style_modified
+    match side {
+        helix_view::diff_session::DiffSide::A => style_deleted,
+        helix_view::diff_session::DiffSide::B => style_added,
     }
 }
 
@@ -2412,9 +2510,10 @@ mod diff_coloring_tests {
             after: 1..2,
         };
         let (minus, plus, delta) = diff_line_char_ranges(&[hunk], &rope, DiffSide::A);
-        assert!(minus.is_empty());
+        // VS Code semantics: the before side of a modification is a removal.
+        assert_eq!(minus, vec![4..8]); // "bbb\n"
         assert!(plus.is_empty());
-        assert_eq!(delta, vec![4..8]); // "bbb\n"
+        assert!(delta.is_empty());
     }
 
     #[test]
@@ -2426,9 +2525,10 @@ mod diff_coloring_tests {
             after: 1..2,
         };
         let (minus, plus, delta) = diff_line_char_ranges(&[hunk], &rope, DiffSide::B);
+        // VS Code semantics: the after side of a modification is an addition.
         assert!(minus.is_empty());
-        assert!(plus.is_empty());
-        assert_eq!(delta, vec![4..8]);
+        assert!(delta.is_empty());
+        assert_eq!(plus, vec![4..8]);
     }
 
     #[test]
@@ -2475,9 +2575,10 @@ mod diff_coloring_tests {
             }, // addition, empty A range
         ];
         let (minus, plus, delta) = diff_line_char_ranges(&hunks, &rope, DiffSide::A);
-        assert_eq!(minus, vec![0..4]); // "aaa\n"
+        // Deletion and modification both bucket as removals on side A.
+        assert_eq!(minus, vec![0..4, 8..12]); // "aaa\n" and "ccc\n"
         assert!(plus.is_empty());
-        assert_eq!(delta, vec![8..12]); // "ccc\n" starts at char 8
+        assert!(delta.is_empty());
     }
 
     #[test]
@@ -2486,24 +2587,17 @@ mod diff_coloring_tests {
         let added = mk(0, 255, 0); // green
         let modified = mk(255, 165, 0); // orange
 
-        // pure deletion on A side = red
-        assert_eq!(
-            diff_line_style(DiffSide::A, true, deleted, added, modified),
-            deleted
-        );
-        // pure addition on B side = green
-        assert_eq!(
-            diff_line_style(DiffSide::B, true, deleted, added, modified),
-            added
-        );
-        // modifications = orange regardless of side
-        assert_eq!(
-            diff_line_style(DiffSide::A, false, deleted, added, modified),
-            modified
-        );
-        assert_eq!(
-            diff_line_style(DiffSide::B, false, deleted, added, modified),
-            modified
-        );
+        // VS Code semantics: the before side is always a removal, the after
+        // side always an addition, whether or not the partner range is empty.
+        for other_empty in [true, false] {
+            assert_eq!(
+                diff_line_style(DiffSide::A, other_empty, deleted, added, modified),
+                deleted
+            );
+            assert_eq!(
+                diff_line_style(DiffSide::B, other_empty, deleted, added, modified),
+                added
+            );
+        }
     }
 }

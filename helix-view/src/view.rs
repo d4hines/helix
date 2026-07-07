@@ -214,7 +214,7 @@ impl View {
     pub fn inner_area(&self, doc: &Document) -> Rect {
         let area = self.area.clip_left(self.gutter_offset(doc)).clip_bottom(1); // -1 for statusline
         if self.diff_map {
-            area.clip_right(1) // -1 for the diff-map column
+            area.clip_right(2) // -2 for the overview-ruler columns
         } else {
             area
         }
@@ -227,7 +227,7 @@ impl View {
     pub fn inner_width(&self, doc: &Document) -> u16 {
         let width = self.area.clip_left(self.gutter_offset(doc)).width;
         if self.diff_map {
-            width.saturating_sub(1)
+            width.saturating_sub(2)
         } else {
             width
         }

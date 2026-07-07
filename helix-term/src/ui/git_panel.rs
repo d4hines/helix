@@ -25,6 +25,38 @@ use crate::ui;
 
 pub const PANEL_WIDTH: u16 = 36;
 
+/// Nerd-font devicon + color for a file name. Colors approximate the
+/// devicons defaults, chosen to sit well on the catppuccin grounds; the
+/// fallback is a plain neutral file glyph.
+fn file_icon(name: &str) -> (&'static str, helix_view::theme::Color) {
+    use helix_view::theme::Color::Rgb;
+    let ext = std::path::Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    match ext {
+        "nix" => ("\u{f313}", Rgb(0x7e, 0xbA, 0xe4)),
+        "rs" => ("\u{e7a8}", Rgb(0xef, 0x97, 0x76)),
+        "ts" | "tsx" => ("\u{e628}", Rgb(0x51, 0x9a, 0xba)),
+        "js" | "jsx" | "mjs" => ("\u{e74e}", Rgb(0xe5, 0xc8, 0x90)),
+        "json" => ("\u{e60b}", Rgb(0xe5, 0xc8, 0x90)),
+        "md" | "markdown" => ("\u{f48a}", Rgb(0x8c, 0xaa, 0xee)),
+        "toml" => ("\u{e6b2}", Rgb(0xef, 0x97, 0x76)),
+        "yaml" | "yml" => ("\u{e6a8}", Rgb(0xca, 0x9e, 0xe6)),
+        "lock" => ("\u{f023}", Rgb(0x94, 0x9c, 0xbb)),
+        "sh" | "bash" | "zsh" => ("\u{f489}", Rgb(0xa6, 0xd1, 0x89)),
+        "py" => ("\u{e73c}", Rgb(0xe5, 0xc8, 0x90)),
+        "go" => ("\u{e627}", Rgb(0x81, 0xc8, 0xbe)),
+        "html" => ("\u{e736}", Rgb(0xef, 0x97, 0x76)),
+        "css" | "scss" => ("\u{e749}", Rgb(0x8c, 0xaa, 0xee)),
+        "c" | "h" => ("\u{e61e}", Rgb(0x8c, 0xaa, 0xee)),
+        "cpp" | "hpp" | "cc" => ("\u{e61d}", Rgb(0x8c, 0xaa, 0xee)),
+        "rb" => ("\u{e739}", Rgb(0xe7, 0x82, 0x84)),
+        "txt" => ("\u{f15c}", Rgb(0xa5, 0xad, 0xce)),
+        _ => ("\u{f016}", Rgb(0x94, 0x9c, 0xbb)),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
     Staged,
@@ -68,6 +100,8 @@ pub struct GitPanel {
     /// File indices awaiting a second `d` to confirm discard.
     pending_discard: Option<Vec<usize>>,
     error: Option<String>,
+    /// When the last `F` fetch completed, for the header's freshness note.
+    last_fetch: Option<std::time::Instant>,
 }
 
 impl GitPanel {
@@ -87,6 +121,7 @@ impl GitPanel {
             marked: HashSet::new(),
             pending_discard: None,
             error: None,
+            last_fetch: None,
         };
         panel.refresh();
         panel
@@ -468,6 +503,7 @@ impl GitPanel {
                     }
                     if let Some(editor_view) = compositor.find::<ui::EditorView>() {
                         if let Some(panel) = &mut editor_view.git_panel {
+                            panel.last_fetch = Some(std::time::Instant::now());
                             panel.refresh();
                         }
                     }
@@ -562,21 +598,16 @@ impl GitPanel {
                 let row_idx = (row - self.area.y) as usize + self.scroll;
                 if let Some(i) = self.file_at(row_idx) {
                     self.cursor = row_idx;
-                    let x = col - self.area.x;
-                    match x {
-                        // glyph zones: [1-2] primary action, [3-4] discard
-                        1 | 2 => {
-                            let unstage = self.files[i].section == Section::Staged;
-                            self.marked.clear();
-                            self.marked.insert(i);
-                            self.stage_or_unstage_targets(cx.editor, unstage);
-                        }
-                        3 | 4 if self.files[i].section == Section::Unstaged => {
-                            self.marked.clear();
-                            self.marked.insert(i);
-                            self.request_discard();
-                        }
-                        _ => self.open_entry(cx.editor, i),
+                    // The status letter cell toggles stage/unstage; the rest
+                    // of the row opens the entry (VS Code single-click).
+                    let letter_x = self.area.x + self.area.width - 3;
+                    if col == letter_x || col == letter_x + 1 {
+                        let unstage = self.files[i].section == Section::Staged;
+                        self.marked.clear();
+                        self.marked.insert(i);
+                        self.stage_or_unstage_targets(cx.editor, unstage);
+                    } else {
+                        self.open_entry(cx.editor, i);
                     }
                 }
                 true
@@ -616,7 +647,6 @@ impl GitPanel {
         let border = theme.get("ui.window");
         let plus = theme.get("diff.plus");
         let minus = theme.get("diff.minus");
-        let delta = theme.get("diff.delta");
         let warning = theme.get("warning");
 
         surface.set_style(area, base);
@@ -630,6 +660,9 @@ impl GitPanel {
 
         let content_width = (area.width - 1) as usize;
         let height = self.content_height();
+        // VS Code letter colors: modifications amber, additions green,
+        // deletions/conflicts red.
+        let modified = theme.get("warning");
 
         for (screen_row, row_idx) in (self.scroll..self.rows.len()).enumerate() {
             if screen_row >= height {
@@ -639,29 +672,64 @@ impl GitPanel {
             match self.rows[row_idx] {
                 Row::Blank => {}
                 Row::Header => {
-                    let mut header = format!(" ⎇ {}", self.branch);
-                    if let (Some(a), Some(b)) = (self.ahead, self.behind) {
-                        header.push_str(&format!("  ↑{a} ↓{b}"));
-                    }
+                    // "  master ↑1 ↓0 · fetched 2m ago" with a hairline below.
+                    let branch_style = theme.get("keyword").patch(base);
                     surface.set_stringn(
                         area.x,
                         y,
-                        &header,
+                        &format!(" \u{e0a0} {}", self.branch),
                         content_width,
-                        text.add_modifier(Modifier::BOLD),
+                        branch_style,
                     );
+                    let branch_cols = 3 + self.branch.chars().count() as u16 + 1;
+                    let mut meta = String::new();
+                    if let (Some(a), Some(b)) = (self.ahead, self.behind) {
+                        meta.push_str(&format!("↑{a} ↓{b}"));
+                    }
+                    if let Some(at) = self.last_fetch {
+                        let mins = at.elapsed().as_secs() / 60;
+                        let ago = if mins == 0 {
+                            "fetched just now".to_string()
+                        } else {
+                            format!("fetched {mins}m ago")
+                        };
+                        if !meta.is_empty() {
+                            meta.push_str(" · ");
+                        }
+                        meta.push_str(&ago);
+                    }
+                    if !meta.is_empty() && (branch_cols as usize) < content_width {
+                        surface.set_stringn(
+                            area.x + branch_cols,
+                            y,
+                            &meta,
+                            content_width - branch_cols as usize,
+                            dim,
+                        );
+                    }
+                    if screen_row + 1 < height && row_idx + 1 <= self.rows.len() {
+                        surface.set_stringn(
+                            area.x,
+                            y + 1,
+                            &"─".repeat(content_width),
+                            content_width,
+                            border,
+                        );
+                    }
                 }
                 Row::Section(section) => {
                     let (label, count) = match section {
                         Section::Staged => ("STAGED CHANGES", self.section_len(Section::Staged)),
                         Section::Unstaged => ("CHANGES", self.section_len(Section::Unstaged)),
                     };
+                    surface.set_stringn(area.x, y, &format!(" {label}"), content_width, dim);
+                    let label_cols = 1 + label.chars().count() as u16;
                     surface.set_stringn(
-                        area.x,
+                        area.x + label_cols + 1,
                         y,
-                        &format!(" {label} ({count})"),
-                        content_width,
-                        text.add_modifier(Modifier::BOLD),
+                        &count.to_string(),
+                        content_width.saturating_sub(label_cols as usize + 1),
+                        text,
                     );
                 }
                 Row::File(i) => {
@@ -675,38 +743,44 @@ impl GitPanel {
                         base
                     };
                     if is_cursor {
-                        let row_rect = helix_view::graphics::Rect::new(
-                            area.x,
-                            y,
-                            area.width - 1,
-                            1,
-                        );
+                        let row_rect =
+                            helix_view::graphics::Rect::new(area.x, y, area.width - 1, 1);
                         surface.set_style(row_rect, row_style);
                     }
 
-                    // marker + action glyphs
+                    // batch marker
                     let marker = if self.marked.contains(&i) { "•" } else { " " };
-                    surface.set_string(area.x, y, marker, text.patch(row_style));
-                    let (primary, discard) = match file.section {
-                        Section::Unstaged => ("+", "✗"),
-                        Section::Staged => ("−", " "),
-                    };
-                    surface.set_string(area.x + 1, y, primary, dim.patch(row_style));
-                    surface.set_string(area.x + 3, y, discard, dim.patch(row_style));
+                    surface.set_string(
+                        area.x,
+                        y,
+                        marker,
+                        theme.get("keyword").patch(row_style),
+                    );
 
-                    // file name + dimmed directory
+                    // devicon
                     let path = Path::new(&file.rela);
                     let name = path
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_else(|| file.rela.clone());
+                    let (icon, icon_color) = file_icon(&name);
+                    surface.set_string(
+                        area.x + 2,
+                        y,
+                        icon,
+                        helix_view::theme::Style::default()
+                            .fg(icon_color)
+                            .patch(row_style),
+                    );
+
+                    // file name + dimmed directory
                     let dir = path
                         .parent()
                         .filter(|p| !p.as_os_str().is_empty())
                         .map(|p| p.to_string_lossy().into_owned())
                         .unwrap_or_default();
-                    let name_x = area.x + 5;
-                    let max_name = content_width.saturating_sub(7);
+                    let name_x = area.x + 4;
+                    let max_name = content_width.saturating_sub(6);
                     surface.set_stringn(name_x, y, &name, max_name, text.patch(row_style));
                     let after_name = name_x + (name.chars().count().min(max_name)) as u16;
                     let letter_x = area.x + area.width - 3;
@@ -720,11 +794,11 @@ impl GitPanel {
                         );
                     }
 
-                    // status letter, colored by kind
+                    // status letter (also the mouse target for stage/unstage)
                     let letter_style = match file.letter {
                         'A' | 'U' => plus,
                         'D' | 'C' => minus,
-                        _ => delta,
+                        _ => modified,
                     };
                     surface.set_string(
                         letter_x,
